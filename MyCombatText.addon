@@ -1,0 +1,14 @@
+## Title: |cff00ccBetter Combat Text|r
+## Author: |cff00ccVixen Hunny |r
+## Version: 1.0
+## APIVersion: 101048
+## SavedVariables: MCT_Saved
+## DependsOn: LibAddonMenu-2.0
+
+MyCombatText.xml
+MyCombatText.Formatting.lua
+MyCombatText.Presets.lua
+MyCombatText.ResultFilter.lua
+MyCombatText.lua
+MyCombatText.Tracking.lua
+MyCombatText.Combat.lua

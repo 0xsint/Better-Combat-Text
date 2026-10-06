@@ -1,0 +1,21 @@
+<GuiXml>
+    <Controls>
+        <!-- 
+            This is your master root window.
+            Everything (labels, textures, effects) should be parented to this,
+            NOT directly to GuiRoot. 
+        -->
+        <TopLevelControl
+            name="MyCombatTextRoot"
+            movable="false"
+            mouseEnabled="false"
+            hidden="false"
+            clampedToScreen="true">
+
+            <!-- Fill the screen so child controls anchor properly -->
+            <Anchor point="TOPLEFT" relativePoint="TOPLEFT" />
+            <Anchor point="BOTTOMRIGHT" relativePoint="BOTTOMRIGHT" />
+
+        </TopLevelControl>
+    </Controls>
+</GuiXml>
