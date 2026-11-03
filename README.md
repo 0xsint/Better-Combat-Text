@@ -59,6 +59,13 @@ MCT:Animate — multi-phase lane animation (rise, jitter, fade)
 
 Floating labels are not created per-event; `MCT:InitPool()` pre-allocates a fixed-size pool (`maxFloatingLabels`, default 40) of label/texture controls that are recycled. Active animations are scheduled into **left / right / center lanes** with staggered timing (`MCT:GetAnimationLane`, `MCT:ProcessLaneQueue`) so simultaneous hits don't visually overlap.
 
+### Performance design
+
+- **Engine-side event filtering.** `EVENT_COMBAT_EVENT` is registered twice with `AddFilterForEvent` (source = player, target = player, `IS_ERROR = false`), so the client only calls into Lua for events that involve you — not every combat event in the zone. `EVENT_POWER_UPDATE` is filtered to `player` and to `reticleover` health.
+- **Reused animation timelines.** ESO never frees `ANIMATION_MANAGER` timelines, so each pooled label owns a few reusable timelines instead of creating a new one per label shown (which previously grew memory for the whole play session).
+- **Allocation-free hot paths.** Merged hits update their bucket in place, the DPS window uses parallel arrays, fonts/colored strings/heart lines are memoized, and `ShowText` is table-driven rather than building lookup tables per call.
+- **Cheap classification.** Combat results are classified with single table lookups (`MCT.Result.Sets`, `MCT.Result.GetCCSpecial`).
+
 ## Features
 
 - **Damage / healing / critical hits** with per-category colors and font sizes, including damage dealt vs. damage taken.
@@ -67,7 +74,7 @@ Floating labels are not created per-event; `MCT:InitPool()` pre-allocates a fixe
 - **Shield-break detection** — fires when a shielded hit is followed by an unshielded hit above `shieldbreakMinDamage` within `shieldbreakWindowMs`.
 - **Reticle priority marker system** — automatically sets a `TARGET_MARKER_TYPE_*` icon (skull/X/sword) on the reticle target based on burst/shieldbreak/pressure rules, with auto-clear and a reticle "flash" visual pop.
 - **Rolling DPS window** — per-target sliding-window DPS, optionally shown on burst.
-- **Resource restore tracking** — Magicka/Stamina/Health gains shown as `+N (✦ Resource)`.
+- **Resource restore tracking** — Magicka/Stamina gains shown as `+N (✦ Resource)` (health gains are already shown as heals).
 - **Hit merging** — rapid multi-hit abilities collapse into a single summed label instead of spamming the screen.
 - **Overhealing tracking**.
 - **Ability icons / "event textures"** next to labels, with performance safeguards (auto-suppressed during high-event-rate bursts).

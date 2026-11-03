@@ -288,3 +288,54 @@ end
 function R.IsDrain(result)
     return HasResult(RESULT_IS_DRAIN, result)
 end
+
+-- ---------------------------------------------------------------
+-- Single-lookup classifiers for the combat hot path.
+-- EVENT_COMBAT_EVENT can fire hundreds of times per second in large
+-- fights; asking eight separate Is*() questions per event costs eight
+-- function calls + table lookups. These tables answer "which CC/
+-- mitigation label is this?" with one indexed read.
+-- ---------------------------------------------------------------
+
+-- result -> ShowText "special" code. Order of precedence matches the
+-- original if/elseif chain (dodge > charm > stun > fear > silence >
+-- disorient > offbalance > immobilize): later sets never overwrite.
+local CC_SPECIAL = {}
+local function AddSpecial(set, special)
+    for result in pairs(set) do
+        if CC_SPECIAL[result] == nil then
+            CC_SPECIAL[result] = special
+        end
+    end
+end
+AddSpecial(RESULT_IS_DODGED, "dodged")
+AddSpecial(RESULT_IS_CHARMED, "charmed")
+AddSpecial(RESULT_IS_STUNNED, "stunned")
+AddSpecial(RESULT_IS_FEARED, "feared")
+AddSpecial(RESULT_IS_SILENCED, "silenced")
+AddSpecial(RESULT_IS_DISORIENTED, "disoriented")
+AddSpecial(RESULT_IS_OFFBALANCE, "offbalanced")
+AddSpecial(RESULT_IS_IMMOBILIZED, "immobilized")
+
+-- Returns the ShowText special code for a CC/dodge result, or nil.
+function R.GetCCSpecial(result)
+    return CC_SPECIAL[result]
+end
+
+-- Raw set tables for callers that want to index them directly
+-- (one table read instead of a function call per check).
+R.Sets = {
+    damage      = RESULT_IS_DAMAGE,
+    damageTaken = RESULT_IS_DAMAGE_TAKEN,
+    heal        = RESULT_IS_HEAL,
+    crit        = RESULT_IS_CRIT,
+    dot         = RESULT_IS_DOT,
+    blocked     = RESULT_IS_BLOCKED,
+    shielded    = RESULT_IS_SHIELDED,
+    miss        = RESULT_IS_MISS,
+    immune      = RESULT_IS_IMMUNE,
+    parried     = RESULT_IS_PARRIED,
+    reflected   = RESULT_IS_REFLECTED,
+    energize    = RESULT_IS_ENERGIZE,
+    drain       = RESULT_IS_DRAIN,
+}

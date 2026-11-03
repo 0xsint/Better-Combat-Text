@@ -10,7 +10,34 @@ local MCT = MyCombatText
 
 -- Local aliases to avoid table lookups in hot paths.
 local GetGameTimeMs = GetGameTimeMilliseconds
-local tinsert = table.insert
+local tremove = table.remove
+local tonumber = tonumber
+local floor = math.floor
+
+-- ---------------------------------------------------------------
+-- GetIconCap: maximum number of ability icons per merged label,
+-- honoring maxEventIcons and the performance-mode cap (1..6).
+-- ---------------------------------------------------------------
+local function GetIconCap()
+    local maxIcons = 6
+    local sv = MCT.sv
+    if sv then
+        local configured = tonumber(sv.maxEventIcons)
+        if configured and configured > 0 then
+            maxIcons = configured
+        end
+        if sv.performanceMode then
+            local perfCap = tonumber(sv.performanceMaxIcons)
+            if perfCap and perfCap > 0 and perfCap < maxIcons then
+                maxIcons = perfCap
+            end
+        end
+    end
+    if maxIcons < 1 then maxIcons = 1 end
+    if maxIcons > 6 then maxIcons = 6 end
+    return maxIcons
+end
+MCT.GetIconCap = GetIconCap
 
 -- ---------------------------------------------------------------
 -- AddAbilityId: maintains a small ordered list of the most recent
@@ -22,42 +49,31 @@ local tinsert = table.insert
 --   list      : the ability ID list table to update
 --   abilityId : the new ESO ability ID integer to record
 -- ---------------------------------------------------------------
-local function AddAbilityId(list, abilityId)
+local function AddAbilityId(list, abilityId, maxIcons)
     -- Ignore invalid or unset ability IDs.
     if not abilityId or abilityId <= 0 then return end
 
+    local n = #list
+    -- Fast path: same ability as the most recent one (multi-hit / DoT ticks).
+    if n > 0 and list[n] == abilityId then return end
+
     -- Remove any previous occurrence of this ID to avoid duplicates.
-    for i = 1, #list do
+    for i = 1, n - 1 do
         if list[i] == abilityId then
-            table.remove(list, i)
+            tremove(list, i)
+            n = n - 1
             break
         end
     end
 
     -- Append the ID at the tail (most recent position).
-    list[#list + 1] = abilityId
+    n = n + 1
+    list[n] = abilityId
 
     -- Evict the oldest ID when over the display cap.
-    local maxIcons = 6
-    if MCT and MCT.sv then
-        local configured = tonumber(MCT.sv.maxEventIcons)
-        if configured and configured > 0 then
-            maxIcons = configured
-        end
-
-        if MCT.sv.performanceMode then
-            local perfCap = tonumber(MCT.sv.performanceMaxIcons)
-            if perfCap and perfCap > 0 and perfCap < maxIcons then
-                maxIcons = perfCap
-            end
-        end
-    end
-
-    if maxIcons < 1 then maxIcons = 1 end
-    if maxIcons > 6 then maxIcons = 6 end
-
-    if #list > maxIcons then
-        table.remove(list, 1)
+    while n > (maxIcons or GetIconCap()) do
+        tremove(list, 1)
+        n = n - 1
     end
 end
 
@@ -152,7 +168,8 @@ MCT.lastPruneMs = MCT.lastPruneMs or 0
 -- MCT.sv.debugMerge is true so there is zero runtime cost when off.
 -- ---------------------------------------------------------------
 local function DebugMerge(fmt, ...)
-    if MCT.sv and MCT.sv.debugMerge then
+    local sv = MCT.sv
+    if sv and sv.debugMerge then
         if select("#", ...) > 0 then
             d("[MCT Merge] " .. string.format(fmt, ...))
         else
@@ -196,11 +213,14 @@ end
 -- ---------------------------------------------------------------
 -- FlushMergeKey: attempts to display and clear a completed merge
 -- bucket. If the bucket is still within the merge window it
--- reschedules itself for another mergeWindowMs delay and returns
--- without displaying, allowing more events to accumulate.
+-- reschedules itself for the remaining time and returns without
+-- displaying, allowing more events to accumulate.
 -- Parameters:
 --   key : the merge bucket string key to flush
 -- ---------------------------------------------------------------
+local flushCallbacks = {}  -- key -> reusable zo_callLater callback (no per-event closures)
+local ScheduleFlush
+
 local function FlushMergeKey(key)
     local data = MCT.merge[key]
     -- Bucket was already flushed by another path; clean up the timer flag.
@@ -209,172 +229,183 @@ local function FlushMergeKey(key)
         return
     end
 
-    local now = GetGameTimeMs()
-    -- If time since the last event in this bucket is still within the merge
-    -- window, reschedule and allow more events to accumulate into it.
-    if now - data.time < MCT.sv.mergeWindowMs then
-        zo_callLater(function()
-            FlushMergeKey(key)
-        end, MCT.sv.mergeWindowMs)
+    local windowMs = MCT.sv.mergeWindowMs
+    local elapsed = GetGameTimeMs() - data.time
+    -- Still inside the merge window: wait only for the remaining time
+    -- (previously a full extra window, which delayed labels up to 2x).
+    if elapsed < windowMs then
+        ScheduleFlush(key, windowMs - elapsed)
         return
     end
 
     DebugMerge("FLUSH key=%s kind=%s value=%s", tostring(key), tostring(data.kind), tostring(data.value))
 
-    -- Dispatch to the correct display function based on the bucket kind.
-    if data.kind == "hit" then
-        -- Normal combat hit: damage or healing number.
-        MCT:ShowText(data.value, data.crit, data.heal, "", data.sID, data.unitId, data.blocked, data.abilityId, data.abilityIds)
-    elseif data.kind == "overhealing" then
-        -- Overhealing: healing that exceeded the target max health.
-        ShowQueuedOverhealing(data.value, data.abilityId, data.abilityIds)
-    elseif data.kind == "resource" then
-        -- Resource restore: magicka/stamina/health gain outside combat hits.
-        MCT:ShowResourceRestore(data.value, data.powerType, data.playerId)
-    end
-
-    -- Clear the bucket and timer flag so the key can be reused.
+    -- Clear the bucket first so anything queued during display starts fresh.
     MCT.merge[key] = nil
     MCT.mergeTimers[key] = nil
+
+    -- Dispatch to the correct display function based on the bucket kind.
+    local kind = data.kind
+    if kind == "hit" then
+        MCT:ShowText(data.value, data.crit, data.heal, "", data.sID, data.unitId, data.blocked, data.abilityId, data.abilityIds)
+    elseif kind == "overhealing" then
+        ShowQueuedOverhealing(data.value, data.abilityId, data.abilityIds)
+    elseif kind == "resource" then
+        MCT:ShowResourceRestore(data.value, data.powerType, data.playerId)
+    end
+end
+
+ScheduleFlush = function(key, delayMs)
+    local cb = flushCallbacks[key]
+    if not cb then
+        cb = function() FlushMergeKey(key) end
+        flushCallbacks[key] = cb
+    end
+    MCT.mergeTimers[key] = true
+    zo_callLater(cb, delayMs)
 end
 
 -- ---------------------------------------------------------------
--- QueueMergedValue: core merge-queue writer. Either adds a new
--- bucket for the given key or accumulates the new value into an
--- existing bucket that is still within the merge window.
--- A zo_callLater flush timer is scheduled on first write only;
--- repeat events within the window just update the bucket in-place.
--- Parameters:
---   key  : merge bucket string key (from GetHitMergeKey)
---   data : table containing kind, value, and event metadata
+-- GetMergeBucket: returns the live bucket for `key` if it is still
+-- inside the merge window, otherwise nil.
 -- ---------------------------------------------------------------
-local function QueueMergedValue(key, data)
-    local now = GetGameTimeMs()
+local function GetLiveBucket(key, now)
     local bucket = MCT.merge[key]
-
-    -- Accumulate into existing bucket if it is still within the merge window.
     if bucket and now - bucket.time < MCT.sv.mergeWindowMs then
-        bucket.value = bucket.value + data.value  -- sum the hit values
-        bucket.time = now                          -- extend the window from this event
-        -- Propagate crit flag: once one event in the bucket was a crit, the whole batch is crit.
-        if data.crit ~= nil then bucket.crit = bucket.crit or data.crit end
-        -- Propagate blocked flag similarly.
-        if data.blocked ~= nil then bucket.blocked = bucket.blocked or data.blocked end
-        -- Always keep the most recent valid ability ID in the bucket.
-        if data.abilityId and data.abilityId > 0 then
-            bucket.abilityId = data.abilityId
-        end
-        -- Merge the incoming ability ID list into the bucket's list.
-        if data.abilityIds then
-            bucket.abilityIds = bucket.abilityIds or {}
-            for i = 1, #data.abilityIds do
-                AddAbilityId(bucket.abilityIds, data.abilityIds[i])
-            end
-        end
-        DebugMerge("MERGE key=%s kind=%s value=%s", tostring(key), tostring(bucket.kind), tostring(bucket.value))
-        return
+        return bucket
     end
+    return nil
+end
 
-    -- No existing bucket (or the old one expired): start a fresh bucket.
+-- ---------------------------------------------------------------
+-- StartBucket: installs a fresh bucket and schedules its flush timer
+-- (only if one isn't already pending for this key).
+-- ---------------------------------------------------------------
+local function StartBucket(key, data, now)
     data.time = now
     MCT.merge[key] = data
     DebugMerge("NEW key=%s kind=%s value=%s", tostring(key), tostring(data.kind), tostring(data.value))
-
-    -- Schedule a flush timer only if one isn't already running for this key.
     if not MCT.mergeTimers[key] then
-        MCT.mergeTimers[key] = true
-        zo_callLater(function()
-            FlushMergeKey(key)
-        end, MCT.sv.mergeWindowMs)
+        ScheduleFlush(key, MCT.sv.mergeWindowMs)
     end
 end
 
 -- ---------------------------------------------------------------
 -- MCT:QueueHit: public entry point for damage and healing hits.
--- Wraps QueueMergedValue with a "hit" kind bucket, automatically
--- computing the merge key from event direction if one is not supplied.
+-- Rapid hits sharing a merge key are summed into one bucket in place;
+-- a new table is only allocated when a fresh bucket starts.
 -- Parameters:
 --   value      : raw hit value (damage or healing amount)
 --   isCrit     : boolean – was this a critical strike/heal?
 --   isHeal     : boolean – healing event (true) or damage (false)
---   sID        : sourceUnitId string
---   unitId     : targetUnitId string
+--   sID        : sourceUnitId
+--   unitId     : targetUnitId
 --   isBlocked  : boolean – was the hit blocked?
 --   abilityId  : ESO ability ID integer for icon display
 --   mergeGroup : optional override merge key; derived automatically if nil
 -- ---------------------------------------------------------------
 function MCT:QueueHit(value, isCrit, isHeal, sID, unitId, isBlocked, abilityId, mergeGroup)
-    -- Use the caller-supplied merge group or derive one from event direction.
     local key = mergeGroup or GetHitMergeKey(isHeal, sID, unitId, isBlocked)
-    local abilityIds = nil
-    if abilityId and abilityId > 0 then
-        abilityIds = { abilityId }
+    local now = GetGameTimeMs()
+    local validAbility = abilityId and abilityId > 0
+
+    local bucket = GetLiveBucket(key, now)
+    if bucket then
+        bucket.value = bucket.value + value
+        bucket.time = now                          -- extend the window from this event
+        if isCrit then bucket.crit = true end      -- one crit makes the batch a crit
+        if isBlocked then bucket.blocked = true end
+        if validAbility then
+            bucket.abilityId = abilityId
+            local ids = bucket.abilityIds
+            if not ids then
+                ids = {}
+                bucket.abilityIds = ids
+            end
+            AddAbilityId(ids, abilityId)
+        end
+        DebugMerge("MERGE key=%s kind=%s value=%s", tostring(key), "hit", tostring(bucket.value))
+        return
     end
 
-    QueueMergedValue(key, {
+    StartBucket(key, {
         kind = "hit",
         value = value,
-        crit = isCrit,
+        crit = isCrit and true or false,
         heal = isHeal,
         sID = sID,
         unitId = unitId,
         blocked = isBlocked and true or false,
         abilityId = abilityId,
-        abilityIds = abilityIds,
-    })
+        abilityIds = validAbility and { abilityId } or nil,
+    }, now)
 end
 
 -- ---------------------------------------------------------------
 -- MCT:QueueOverhealing: queues an overhealing event for display.
--- Overhealing is healing that exceeds the target's maximum health,
--- shown separately from normal healing to indicate wasted throughput.
 -- All overheals from the same merge window are summed into one label.
--- Parameters:
---   amount    : overhealing amount (the overflow value from the event)
---   isCrit    : boolean – was the source heal a critical?
---   sID       : sourceUnitId
---   unitId    : targetUnitId
---   abilityId : ability that generated the overheal
 -- ---------------------------------------------------------------
 function MCT:QueueOverhealing(amount, isCrit, sID, unitId, abilityId)
-    -- All overhealing merges into a single bucket regardless of ability/target.
     local key = "overheal"
-    local abilityIds = nil
-    if abilityId and abilityId > 0 then
-        abilityIds = { abilityId }
+    local now = GetGameTimeMs()
+    local validAbility = abilityId and abilityId > 0
+
+    local bucket = GetLiveBucket(key, now)
+    if bucket then
+        bucket.value = bucket.value + amount
+        bucket.time = now
+        if isCrit then bucket.crit = true end
+        if validAbility then
+            bucket.abilityId = abilityId
+            local ids = bucket.abilityIds
+            if not ids then
+                ids = {}
+                bucket.abilityIds = ids
+            end
+            AddAbilityId(ids, abilityId)
+        end
+        return
     end
 
-    QueueMergedValue(key, {
+    StartBucket(key, {
         kind = "overhealing",
         value = amount,
-        crit = isCrit,
+        crit = isCrit and true or false,
         sID = sID,
         unitId = unitId,
         abilityId = abilityId,
-        abilityIds = abilityIds,
-    })
+        abilityIds = validAbility and { abilityId } or nil,
+    }, now)
 end
 
 -- ---------------------------------------------------------------
--- MCT:QueueResourceRestore: queues a resource gain event for display
--- (magicka, stamina, or health restore from regens/procs/potions).
--- Each power type gets its own merge bucket so the labels aggregate
--- correctly without mixing resource types.
--- Parameters:
---   amount    : amount of resource restored
---   powerType : POWERTYPE_MAGICKA / STAMINA / HEALTH constant
---   playerId  : player unit id for positioning
+-- MCT:QueueResourceRestore: queues a resource gain for display.
+-- Each power type gets its own merge bucket (cached key string).
 -- ---------------------------------------------------------------
+local resourceKeys = {}
+
 function MCT:QueueResourceRestore(amount, powerType, playerId)
-    -- Separate merge key per resource type prevents magicka and stamina
-    -- restores from being summed together into a single number.
-    local key = string.format("resource:%s", tostring(powerType or 0))
-    QueueMergedValue(key, {
+    local pt = powerType or 0
+    local key = resourceKeys[pt]
+    if not key then
+        key = "resource:" .. tostring(pt)
+        resourceKeys[pt] = key
+    end
+
+    local now = GetGameTimeMs()
+    local bucket = GetLiveBucket(key, now)
+    if bucket then
+        bucket.value = bucket.value + amount
+        bucket.time = now
+        return
+    end
+
+    StartBucket(key, {
         kind = "resource",
         value = amount,
         powerType = powerType,
         playerId = playerId,
-    })
+    }, now)
 end
 
 -- ---------------------------------------------------------------
@@ -384,9 +415,10 @@ end
 -- attackable, and must be a player or PvP-flagged unit.
 -- ---------------------------------------------------------------
 local function CanMark(targetUnitId)
-    if not DoesUnitExist("reticleover") then return false end
+    -- Pure-Lua comparison first so the common case never touches the unit API.
     -- Marker must be for the unit that is currently under the reticle.
-    if MCT:GetPlayerUnitId() ~= targetUnitId then return false end
+    if MCT._playerUnitId ~= targetUnitId then return false end
+    if not DoesUnitExist("reticleover") then return false end
     if not IsUnitAttackable("reticleover") then return false end
     -- Only mark PvP-relevant targets to avoid cluttering PvE fights.
     if not IsUnitPvPFlagged("reticleover") and not IsUnitPlayer("reticleover") then return false end
@@ -475,17 +507,21 @@ end
 --   damage       : damage amount for this hit
 --   isCrit       : whether this hit was a critical strike
 -- ---------------------------------------------------------------
-function MCT:TrackBurst(targetUnitId, damage, isCrit)
-    if not MCT.sv.burstEnabled then return end
+function MCT:TrackBurst(targetUnitId, damage, isCrit, now)
+    local sv = MCT.sv
+    if not sv.burstEnabled then return end
     if not targetUnitId or targetUnitId == 0 then return end
 
-    local now = GetGameTimeMs()
+    now = now or GetGameTimeMs()
     local t = MCT.burstTargets[targetUnitId]
 
     -- Reset the window if there is none or the previous one has expired.
-    if not t or now - t.startTime > (tonumber(MCT.sv.burstWindowMs) or 1200) then
+    -- Expired windows are reused in place instead of reallocated.
+    if not t then
         t = { damage = 0, hits = 0, crits = 0, startTime = now }
         MCT.burstTargets[targetUnitId] = t
+    elseif now - t.startTime > (tonumber(sv.burstWindowMs) or 1200) then
+        t.damage, t.hits, t.crits, t.startTime = 0, 0, 0, now
     end
 
     -- Accumulate this hit into the current window.
@@ -494,12 +530,12 @@ function MCT:TrackBurst(targetUnitId, damage, isCrit)
     if isCrit then t.crits = t.crits + 1 end
 
     -- Fire the burst event if all three thresholds are satisfied.
-    if t.hits >= (tonumber(MCT.sv.burstMinHits) or 3)
-       and t.damage >= (tonumber(MCT.sv.burstMinDamage) or 12000)
-       and t.crits >= (tonumber(MCT.sv.burstMinCrits) or 1) then
-        MCT:OnBurst(targetUnitId, t)
+    if t.hits >= (tonumber(sv.burstMinHits) or 3)
+       and t.damage >= (tonumber(sv.burstMinDamage) or 12000)
+       and t.crits >= (tonumber(sv.burstMinCrits) or 1) then
         -- Clear the window so the burst can trigger again after the next window fills.
         MCT.burstTargets[targetUnitId] = nil
+        MCT:OnBurst(targetUnitId, t)
     end
 end
 
@@ -513,15 +549,21 @@ end
 --   damage       : damage amount (used for the minimum threshold guard)
 --   isShielded   : true when ACTION_RESULT_DAMAGE_SHIELDED was the result
 -- ---------------------------------------------------------------
-function MCT:TrackShieldbreak(targetUnitId, damage, isShielded)
-    if not MCT.sv.shieldbreakEnabled then return end
+function MCT:TrackShieldbreak(targetUnitId, damage, isShielded, now)
+    local sv = MCT.sv
+    if not sv.shieldbreakEnabled then return end
     if not targetUnitId or targetUnitId == 0 then return end
     -- Ignore hits too small to be considered a meaningful shieldbreak.
-    if damage < (tonumber(MCT.sv.shieldbreakMinDamage) or 3000) then return end
+    if damage < (tonumber(sv.shieldbreakMinDamage) or 3000) then return end
 
-    local now = GetGameTimeMs()
-    local s = MCT.shields[targetUnitId] or { lastShield = false, t = 0 }
-    MCT.shields[targetUnitId] = s
+    now = now or GetGameTimeMs()
+    local s = MCT.shields[targetUnitId]
+    if not s then
+        -- Nothing to detect until a shielded hit has been seen.
+        if not isShielded then return end
+        s = { lastShield = false, t = 0 }
+        MCT.shields[targetUnitId] = s
+    end
 
     if isShielded then
         -- Record that the last significant hit was absorbed by a shield.
@@ -531,7 +573,7 @@ function MCT:TrackShieldbreak(targetUnitId, damage, isShielded)
     end
 
     -- Unshielded hit: check whether it follows a shielded hit within the window.
-    if s.lastShield and now - s.t <= (tonumber(MCT.sv.shieldbreakWindowMs) or 900) then
+    if s.lastShield and now - s.t <= (tonumber(sv.shieldbreakWindowMs) or 900) then
         s.lastShield = false  -- Reset so we don't repeat the shieldbreak alert.
         MCT:OnShieldbreak(targetUnitId)
     end
@@ -551,18 +593,22 @@ function MCT:OnBurst(targetUnitId, burst)
     MCT:ShowText(burst.damage, true, false, "burst", MCT:GetPlayerUnitId(), targetUnitId, false)
 
     -- Flash the on-screen reticle highlight overlay if configured.
-    if MCT.sv.reticleHighlightEnabled then
-        -- Stop any in-progress flash before starting a new one.
-        if MCT.reticleFlashTL then MCT.reticleFlashTL:Stop() end
-        MCT.reticleFlash:SetAlpha(1)
-        local rtl = ANIMATION_MANAGER:CreateTimeline()
+    if MCT.sv.reticleHighlightEnabled and MCT.reticleFlash then
         -- Hold fully visible for most of the duration, then fade out in the last 300ms.
-        local holdMs = math.max(0, MCT.sv.reticleHighlightMs - 300)
-        local rfade = rtl:InsertAnimation(ANIMATION_ALPHA, MCT.reticleFlash, holdMs)
-        rfade:SetAlphaValues(1, 0)
-        rfade:SetDuration(300)
-        rtl:SetHandler("OnStop", function() MCT.reticleFlashTL = nil end)
-        MCT.reticleFlashTL = rtl
+        -- ESO never frees animation timelines, so one is built and reused; it is
+        -- only rebuilt when the configured hold duration changes.
+        local holdMs = math.max(0, (tonumber(MCT.sv.reticleHighlightMs) or 600) - 300)
+        local rtl = MCT.reticleFlashTL
+        if rtl then rtl:Stop() end
+        if not rtl or MCT._reticleFlashHoldMs ~= holdMs then
+            rtl = ANIMATION_MANAGER:CreateTimeline()
+            local rfade = rtl:InsertAnimation(ANIMATION_ALPHA, MCT.reticleFlash, holdMs)
+            rfade:SetAlphaValues(1, 0)
+            rfade:SetDuration(300)
+            MCT.reticleFlashTL = rtl
+            MCT._reticleFlashHoldMs = holdMs
+        end
+        MCT.reticleFlash:SetAlpha(1)
         rtl:PlayFromStart()
     end
 
@@ -571,9 +617,8 @@ function MCT:OnBurst(targetUnitId, burst)
 
     -- Optionally display the rolling DPS at the burst moment.
     if MCT.sv.dpsShowOnBurst then
-        local dps = MCT:GetDps(targetUnitId)
-        local dps = tonumber(dps)
-        if dps >= tonumber(MCT.sv.dpsMinShow) then
+        local dps = tonumber(MCT:GetDps(targetUnitId)) or 0
+        if dps > 0 and dps >= (tonumber(MCT.sv.dpsMinShow) or 0) then
             MCT:ShowText(dps .. " DPS", true, false, "burst", MCT:GetPlayerUnitId(), targetUnitId, false)
         end
     end
@@ -589,78 +634,87 @@ function MCT:OnShieldbreak(targetUnitId)
 end
 
 -- ---------------------------------------------------------------
--- PruneDpsBucket: removes event entries older than windowMs from
--- a DPS bucket and adjusts the running sum accordingly. Also
--- compacts the internal events array when the dead-entry head
--- index grows past 64 to prevent unbounded memory growth.
--- Parameters:
---   bucket   : the DPS bucket table for a target
---   now      : current time in milliseconds
---   windowMs : rolling window length in milliseconds
+-- DPS buckets store hits in two parallel arrays (times / dmgs) with a
+-- moving head index, so recording a hit allocates nothing. The dead
+-- prefix is compacted in place once it grows past 64 entries.
+--   bucket = { times = {}, dmgs = {}, head = 1, tail = 0, sum = 0 }
 -- ---------------------------------------------------------------
 local function PruneDpsBucket(bucket, now, windowMs)
-    local ev = bucket.events
-    local head = bucket.head
+    local times, dmgs = bucket.times, bucket.dmgs
+    local head, tail = bucket.head, bucket.tail
+    local sum = bucket.sum
     -- Walk forward from the head until we find an event still inside the window.
-    while head <= #ev and now - ev[head].t > windowMs do
-        bucket.sum = bucket.sum - ev[head].dmg  -- remove this event from the sum
-        ev[head] = nil                           -- allow GC of the entry
+    while head <= tail and now - times[head] > windowMs do
+        sum = sum - dmgs[head]
+        times[head] = nil
+        dmgs[head] = nil
         head = head + 1
     end
-    bucket.head = head
 
-    -- Compact the array once the dead region at the front is large.
-    if head > 64 then
-        local live = {}
-        for i = head, #ev do
-            live[#live + 1] = ev[i]
-        end
-        bucket.events = live
-        bucket.head = 1
+    if head > tail then
+        -- Empty: rewind to the start of the arrays.
+        bucket.head, bucket.tail, bucket.sum = 1, 0, 0
+        return
     end
+
+    -- Compact in place once the dead region at the front is large.
+    if head > 64 then
+        local n = 0
+        for i = head, tail do
+            n = n + 1
+            times[n] = times[i]
+            dmgs[n] = dmgs[i]
+        end
+        for i = n + 1, tail do
+            times[i] = nil
+            dmgs[i] = nil
+        end
+        head, tail = 1, n
+    end
+
+    bucket.head, bucket.tail, bucket.sum = head, tail, sum
+end
+
+local function GetDpsWindowMs(sv)
+    return (tonumber(sv.dpsWindowSec) or 10) * 1000
 end
 
 -- ---------------------------------------------------------------
 -- MCT:AddDps: records a damage hit into the rolling DPS bucket for
 -- the given target and trims events outside the configured window.
--- Parameters:
---   targetUnitId : the unit that received the damage
---   damage       : the damage amount to add to the DPS sum
 -- ---------------------------------------------------------------
-function MCT:AddDps(targetUnitId, damage)
-    if not MCT.sv.dpsEnabled then return end
-    local now = GetGameTimeMs()
-    local windowMs = MCT.sv.dpsWindowSec * 1000  -- convert seconds to ms
+function MCT:AddDps(targetUnitId, damage, now)
+    local sv = MCT.sv
+    if not sv.dpsEnabled then return end
+    if not targetUnitId then return end
+    now = now or GetGameTimeMs()
 
-    -- Create a fresh bucket for this target if none exists yet.
     local b = MCT.dps[targetUnitId]
     if not b then
-        b = { events = {}, sum = 0, head = 1 }
+        b = { times = {}, dmgs = {}, head = 1, tail = 0, sum = 0 }
         MCT.dps[targetUnitId] = b
     end
 
-    -- Append the new event and keep the running sum current.
-    tinsert(b.events, { t = now, dmg = damage })
+    local tail = b.tail + 1
+    b.times[tail] = now
+    b.dmgs[tail] = damage
+    b.tail = tail
     b.sum = b.sum + damage
-    PruneDpsBucket(b, now, windowMs)
+    PruneDpsBucket(b, now, GetDpsWindowMs(sv))
 end
 
 -- ---------------------------------------------------------------
 -- MCT:GetDps: returns the current rolling DPS for a target as an
--- integer. Prunes stale events before calculating to ensure accuracy.
--- Returns 0 if no bucket exists (target not being damaged).
+-- integer (0 when the target has no recent damage).
 -- ---------------------------------------------------------------
 function MCT:GetDps(targetUnitId)
     local b = MCT.dps[targetUnitId]
     if not b then return 0 end
-    local now = GetGameTimeMs()
-    local windowMs = MCT.sv.dpsWindowSec * 1000
-
-    -- Prune first so the sum reflects only the active window.
-    PruneDpsBucket(b, now, windowMs)
-    -- Divide total damage in the window by window length in seconds.
-    local dps  = math.floor(b.sum / MCT.sv.dpsWindowSec)
-    return dps
+    local sv = MCT.sv
+    PruneDpsBucket(b, GetGameTimeMs(), GetDpsWindowMs(sv))
+    local windowSec = tonumber(sv.dpsWindowSec) or 10
+    if windowSec <= 0 then return 0 end
+    return floor(b.sum / windowSec)
 end
 
 -- ---------------------------------------------------------------
@@ -676,7 +730,7 @@ function MCT:PruneTrackingTables(now)
     MCT.lastPruneMs = now
 
     -- Evict burst windows that are more than 2x the burst window old.
-    local burstExpiry = MCT.sv.burstWindowMs * 2
+    local burstExpiry = (tonumber(MCT.sv.burstWindowMs) or 1200) * 2
     for unitId, t in pairs(MCT.burstTargets) do
         if now - t.startTime > burstExpiry then
             MCT.burstTargets[unitId] = nil
@@ -684,7 +738,7 @@ function MCT:PruneTrackingTables(now)
     end
 
     -- Evict shield-state entries that are more than 2x the shieldbreak window old.
-    local shieldExpiry = MCT.sv.shieldbreakWindowMs * 2
+    local shieldExpiry = (tonumber(MCT.sv.shieldbreakWindowMs) or 900) * 2
     for unitId, s in pairs(MCT.shields) do
         if now - s.t > shieldExpiry then
             MCT.shields[unitId] = nil
@@ -693,13 +747,16 @@ function MCT:PruneTrackingTables(now)
 
     -- Prune and evict empty DPS buckets.
     if MCT.sv.dpsEnabled then
-        local windowMs = MCT.sv.dpsWindowSec * 1000
+        local windowMs = GetDpsWindowMs(MCT.sv)
         for unitId, bucket in pairs(MCT.dps) do
             PruneDpsBucket(bucket, now, windowMs)
             -- Remove the bucket entirely when all events have expired.
-            if bucket.sum <= 0 or bucket.head > #bucket.events then
+            if bucket.head > bucket.tail then
                 MCT.dps[unitId] = nil
             end
         end
+    else
+        -- Feature turned off mid-session: drop any leftover buckets.
+        if next(MCT.dps) then MCT.dps = {} end
     end
 end

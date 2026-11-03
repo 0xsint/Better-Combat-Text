@@ -43,7 +43,7 @@
 --    Now displays when your character gains:
 --    - Magicka (shown as "✦ Magicka")
 --    - Stamina (shown as "✦ Stamina") 
---    - Health (shown as "✦ Health")
+--    (Health gains are shown as heals, so they are not repeated here.)
 --    Displays as: "+2500 (✦ Magicka)" with animation
 
 -- 3. EVENT TEXTURES & ICONS

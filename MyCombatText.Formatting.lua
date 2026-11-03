@@ -87,8 +87,9 @@ end
 
 -- GetCombatFontStyleKey: resolves SavedVariables value to a valid style key.
 function MCT:GetCombatFontStyleKey()
-    local key = tostring((self.sv and self.sv.combatFontStyle) or "DEFAULT")
-    if not self.CombatFontStyles[key] then
+    local sv = MCT.sv
+    local key = sv and sv.combatFontStyle or "DEFAULT"
+    if not MCT.CombatFontStyles[key] then
         key = "DEFAULT"
     end
     return key
@@ -114,18 +115,31 @@ function MCT:GetCombatFontStyleChoices()
     return labels, values
 end
 
+-- Heart decoration lines are identical for a given (path, count), so build
+-- each one once instead of on every label.
+local heartLineCache = {}
+
 local function BuildHeartTextureLine(iconPath, iconCount)
     local count = tonumber(iconCount) or 3
     if count < 1 then count = 1 end
 
-        local resolvedPath = tostring(iconPath or "MyCombatText/media/glossy-pink.dds")
+    local resolvedPath = tostring(iconPath or "MyCombatText/media/glossy-pink.dds")
+    local byPath = heartLineCache[resolvedPath]
+    if not byPath then
+        byPath = {}
+        heartLineCache[resolvedPath] = byPath
+    end
+    local cached = byPath[count]
+    if cached then return cached end
+
     local icon = "|t18:18:" .. resolvedPath .. "|t"
     local line = {}
     for i = 1, count do
-        line[#line + 1] = icon
+        line[i] = icon
     end
-
-    return table.concat(line, "  ")
+    cached = table.concat(line, "  ")
+    byPath[count] = cached
+    return cached
 end
 
 -- GetCachedCombatFont: style-aware cached font descriptor.
@@ -140,15 +154,22 @@ function MCT:GetCachedCombatFont(size, useBurstFace)
 
     numericSize = math.max(8, math.floor((numericSize * sizeMultiplier) + 0.5))
 
+    -- Nested lookup [style][burst|normal][size] — no per-call key string or
+    -- temporary table (the old version allocated both on every label).
     local styleKey = self:GetCombatFontStyleKey()
-    local style = self:GetCombatFontStyle()
-    local face = (useBurstFace and style.burstFace) or style.fontFace or "EsoUI/Common/Fonts/FTN57.otf"
-    local cacheKey = table.concat({ styleKey, tostring(face), tostring(numericSize), useBurstFace and "burst" or "normal" }, "|")
+    local byStyle = self._fontCacheByStyle[styleKey]
+    if not byStyle then
+        byStyle = { [true] = {}, [false] = {} }
+        self._fontCacheByStyle[styleKey] = byStyle
+    end
+    local bySize = byStyle[useBurstFace and true or false]
 
-    local font = self._fontCacheByStyle[cacheKey]
+    local font = bySize[numericSize]
     if not font then
+        local style = self.CombatFontStyles[styleKey] or self.CombatFontStyles.DEFAULT
+        local face = (useBurstFace and style.burstFace) or style.fontFace or "EsoUI/Common/Fonts/FTN57.otf"
         font = tostring(face) .. "|" .. tostring(numericSize) .. "|soft-shadow-thick"
-        self._fontCacheByStyle[cacheKey] = font
+        bySize[numericSize] = font
     end
     return font
 end
@@ -165,17 +186,22 @@ end
 -- StylizeDisplayText: applies the selected text style decoration to a label
 -- payload while preserving existing color markup inside `text`.
 function MCT:StylizeDisplayText(text, eventCode)
-    local s = tostring(text or "")
+    local s = text
+    if type(s) ~= "string" then s = tostring(text or "") end
     local styleKey = self:GetCombatFontStyleKey()
-    local heartCount = tonumber(self.sv and self.sv.heartCount) or 3
-    local heartsEnabled = (self.sv and self.sv.enableHeartTextures) == true
+    if styleKey == "DEFAULT" then
+        return s -- fast path: most users never change the style
+    end
 
-        if styleKey == "HEARTS" and heartsEnabled then
-            local top = BuildHeartTextureLine("MyCombatText/media/glossy-pink.dds", heartCount)
-            return top .. "\n" .. s
-        elseif styleKey == "HEARTS_WHITE" and heartsEnabled then
-            local top = BuildHeartTextureLine("MyCombatText/media/glossy-white.dds", heartCount)
-            return top .. "\n" .. s
+    local sv = self.sv
+    local heartsEnabled = sv and sv.enableHeartTextures == true
+
+    if styleKey == "HEARTS" and heartsEnabled then
+        local top = BuildHeartTextureLine("MyCombatText/media/glossy-pink.dds", sv.heartCount)
+        return top .. "\n" .. s
+    elseif styleKey == "HEARTS_WHITE" and heartsEnabled then
+        local top = BuildHeartTextureLine("MyCombatText/media/glossy-white.dds", sv.heartCount)
+        return top .. "\n" .. s
     elseif styleKey == "IMPERIAL" then
         return "[ " .. s .. " ]"
     elseif styleKey == "ARCANE" then
@@ -195,6 +221,27 @@ function MCT:ColorText(hex, text, suffix)
         return "|c" .. tostring(hex) .. tostring(text) .. tostring(suffix) .. "|r"
     end
     return "|c" .. tostring(hex) .. tostring(text) .. "|r"
+end
+
+-- ColorTextCached: like ColorText(hex, text) but memoizes the result per
+-- (text, hex) pair. Used for fixed labels ("MISS", "STUN", "LOW HEALTH!")
+-- that are shown repeatedly, so steady-state combat creates no new strings.
+-- Do not use it for numeric values (unbounded key space).
+local colorTextCache = {}
+
+function MCT:ColorTextCached(hex, text)
+    hex = hex or "ffffff"
+    local byText = colorTextCache[text]
+    if not byText then
+        byText = {}
+        colorTextCache[text] = byText
+    end
+    local s = byText[hex]
+    if not s then
+        s = "|c" .. tostring(hex) .. tostring(text) .. "|r"
+        byText[hex] = s
+    end
+    return s
 end
 
 -- FormatShortNumber: converts a large integer into a human-readable

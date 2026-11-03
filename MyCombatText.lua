@@ -472,9 +472,12 @@ function MCT:InitPool()
     -- associated texture set `t`. Called when a label is released back
     -- to the pool so the next user starts with a fully clean slate.
     local function ResetLabel(l, t)
-        if l.mctTimeline then
-            l.mctTimeline:Stop()    -- Stop any in-progress animation immediately.
+        local tl = l.mctTimeline
+        if tl then
+            -- Clear first so the timeline's OnStop handler sees a stale stop
+            -- and doesn't try to release this label a second time.
             l.mctTimeline = nil
+            tl:Stop()               -- Stop any in-progress animation immediately.
         end
         l:SetHidden(true)
         l:ClearAnchors()
@@ -484,14 +487,20 @@ function MCT:InitPool()
         l.mctAbilityId  = nil   -- Single ability ID (fast path).
         l.mctAbilityIds = nil   -- List of ability IDs (multi-hit merge path).
         l.mctEventCode  = nil   -- Category code used for icon and animation lookup.
-        l.mctQueueToken = nil
+        -- Bump (never reset) the queue token so any lane-queue entry still
+        -- pointing at this label is recognised as stale, even after reuse.
+        l.mctQueueToken = (l.mctQueueToken or 0) + 1
+        l.mctQueued     = nil
 
         if t then
             for i = 1, #t do
-                t[i]:SetHidden(true)
-                t[i]:ClearAnchors()
-                t[i]:SetTexture("")
-                t[i].mctTexturePath = ""
+                local tex = t[i]
+                if not tex:IsHidden() then
+                    tex:SetHidden(true)
+                    tex:ClearAnchors()
+                end
+                -- The texture path is kept: re-showing the same icon later
+                -- then skips a SetTexture (file lookup) call entirely.
             end
         end
     end
@@ -527,6 +536,23 @@ function MCT:InitPool()
         return nil
     end
 
+    -- ReclaimIdleKey: finds an active label that is neither animating nor
+    -- waiting in a lane queue, releases it, and returns its key for reuse.
+    function pool:ReclaimIdleKey()
+        for i = self.activeHead, #self.activeOrder do
+            local key = self.activeOrder[i]
+            if key and self.activeSet[key] then
+                local label = self.labels[key]
+                local tl = label and label.mctTimeline
+                if label and not label.mctQueued and not (tl and tl:IsPlaying()) then
+                    self:ReleaseObject(key)
+                    return table.remove(self.freeKeys)
+                end
+            end
+        end
+        return nil
+    end
+
     -- AcquireObject: returns a ready-to-use label and its pool key.
     -- Three allocation paths:
     --   1. Re-use a key from the freeKeys stack (cheapest, most common).
@@ -540,12 +566,18 @@ function MCT:InitPool()
                 key = self.nextKey
                 self.nextKey = self.nextKey + 1
                 self.labels[key] = CreateLabel()
+                self.labels[key].mctPoolKey = key
                 self.textures[key] = { CreateTexture() }
             else
-                -- Pool is full: drop this event rather than killing an active label
-                -- mid-animation. The event is silently discarded; active labels finish
-                -- their animations and return to the pool naturally.
-                return nil, nil
+                -- Pool is full. Safety net: reclaim the oldest active label whose
+                -- animation is no longer running (e.g. it was queued in a lane that
+                -- got reset, or its timeline stopped without notifying us).
+                key = self:ReclaimIdleKey()
+                if not key then
+                    -- Every label is genuinely mid-animation: drop this event rather
+                    -- than killing an active label.
+                    return nil, nil
+                end
             end
         end
 
@@ -679,20 +711,26 @@ end
 -- If the ability list resolves to nothing, falls back to a single
 -- category icon via MCT:GetEventTexture(eventCode).
 -- ---------------------------------------------------------------
-function MCT:ResolveEventTextures(abilityIds, eventCode)
-    local textures = {}
-    local maxIcons = tonumber(MCT.sv and MCT.sv.maxEventIcons) or 3
-    if maxIcons < 1 then maxIcons = 1 end
-    if maxIcons > 6 then maxIcons = 6 end
+local resolvedTexturesScratch = {}
 
-    if MCT.sv and MCT.sv.performanceMode then
-        local perfCap = tonumber(MCT.sv.performanceMaxIcons)
-        if perfCap and perfCap > 0 and perfCap < maxIcons then
-            maxIcons = perfCap
-        end
+-- NOTE: the returned table is a reused scratch buffer; consume it before the
+-- next call (SetEventTexture does) and don't keep a reference to it.
+function MCT:ResolveEventTextures(abilityIds, eventCode, singleAbilityId)
+    local textures = resolvedTexturesScratch
+    for i = #textures, 1, -1 do textures[i] = nil end
+
+    if not MCT.sv.showEventTextures or MCT:AreEventTexturesTemporarilySuppressed() then
+        return textures
     end
 
-    if abilityIds then
+    local maxIcons = MCT.GetIconCap and MCT.GetIconCap() or 3
+
+    if not abilityIds and singleAbilityId then
+        local texturePath = MCT:ResolveEventTexture(singleAbilityId, eventCode)
+        if texturePath and texturePath ~= "" then
+            textures[1] = texturePath
+        end
+    elseif abilityIds then
         for i = 1, #abilityIds do
             local texturePath = MCT:ResolveEventTexture(abilityIds[i], eventCode)
             if texturePath and texturePath ~= "" then
@@ -765,15 +803,21 @@ end
 -- GetLabelFontSize: parses the current font string of a label to extract
 -- the numeric point size. ESO font strings use the format "path|size|flags".
 -- Falls back to MCT.sv.fontSize if the label has no font or parsing fails.
+local fontSizeByFontString = {}
+
 local function GetLabelFontSize(label)
     local font = label and label.GetFont and label:GetFont()
     if not font then
         return tonumber(MCT.sv and MCT.sv.fontSize) or 28
     end
 
-    -- ESO font strings are typically: "path|size|flags" or "ZoFontCombat|size|flags"
-    local sizeStr = string.match(font, "|(%d+)|")
-    local size = tonumber(sizeStr)
+    -- ESO font strings are typically: "path|size|flags" or "ZoFontCombat|size|flags".
+    -- Only a handful of distinct font strings exist, so parse each once.
+    local size = fontSizeByFontString[font]
+    if size == nil then
+        size = tonumber(string.match(font, "|(%d+)|")) or false
+        fontSizeByFontString[font] = size
+    end
     if not size then
         size = tonumber(MCT.sv and MCT.sv.fontSize) or 28
     end
@@ -836,13 +880,13 @@ function MCT:LayoutEventTexture(poolKey)
     if visibleCount == 0 then return end
 
     local slot = 0
+    local step = iconSize + textureGap
     for i = 1, #textureSet do
         local texture = textureSet[i]
-        texture:SetDimensions(iconSize, iconSize)
-        texture:ClearAnchors()
         if not texture:IsHidden() then
+            texture:SetDimensions(iconSize, iconSize)
+            texture:ClearAnchors()
             slot = slot + 1
-            local step = iconSize + textureGap
             local textureOffset = offset - ((visibleCount - slot) * step)
             texture:SetAnchor(RIGHT, label, CENTER, textureOffset, 0)
         end
@@ -863,17 +907,22 @@ function MCT:SetEventTexture(poolKey, abilityId, eventCode, abilityIds)
     local label = MCT.pool.labels[poolKey]
     if not textureSet or not label then return end
 
-    local texturePaths = MCT:ResolveEventTextures(abilityIds or (abilityId and { abilityId } or nil), eventCode)
+    local texturePaths = MCT:ResolveEventTextures(abilityIds, eventCode, abilityId)
     if #texturePaths == 0 then
         for i = 1, #textureSet do
-            textureSet[i]:SetHidden(true)
-            textureSet[i]:ClearAnchors()
-            textureSet[i]:SetTexture("")
+            local texture = textureSet[i]
+            if not texture:IsHidden() then
+                texture:SetHidden(true)
+                texture:ClearAnchors()
+            end
         end
         return
     end
 
-    while #textureSet < #texturePaths do
+    local pathCount = #texturePaths
+    local maxIcons = MCT.GetIconCap and MCT.GetIconCap() or 6
+    if pathCount > maxIcons then pathCount = maxIcons end
+    while #textureSet < pathCount do
         textureSet[#textureSet + 1] = WM:CreateControl(nil, _G["MyCombatTextRoot"], CT_TEXTURE)
         textureSet[#textureSet]:SetDrawLayer(DL_OVERLAY)
         textureSet[#textureSet]:SetDrawTier(DT_HIGH)
@@ -883,20 +932,16 @@ function MCT:SetEventTexture(poolKey, abilityId, eventCode, abilityIds)
 
     for i = 1, #textureSet do
         local texture = textureSet[i]
-        local texturePath = texturePaths[i]
+        local texturePath = (i <= pathCount) and texturePaths[i] or nil
         if texturePath then
             if texture.mctTexturePath ~= texturePath then
                 texture:SetTexture(texturePath)
                 texture.mctTexturePath = texturePath
             end
             texture:SetHidden(false)
-        else
+        elseif not texture:IsHidden() then
             texture:SetHidden(true)
             texture:ClearAnchors()
-            if texture.mctTexturePath ~= "" then
-                texture:SetTexture("")
-                texture.mctTexturePath = ""
-            end
         end
     end
 
@@ -997,8 +1042,8 @@ local function GetAnimationTimingForCode(sv, code)
     return moveDur, fadeDur, fadeDelay
 end
 
-local function GetLaneStaggerMs(sv, code)
-    local moveDur = GetAnimationTimingForCode(sv, code)
+local function GetLaneStaggerMs(sv, code, moveDur)
+    moveDur = moveDur or GetAnimationTimingForCode(sv, code)
     local percent = tonumber(sv and sv.laneQueueStaggerPercent) or 5
 
     if sv and sv.performanceMode then
@@ -1028,24 +1073,121 @@ function MCT:GetAnimationLane(code)
     return "left"
 end
 
+-- One reusable pump callback per lane (no closure allocated per schedule).
+local lanePumpCallbacks = {}
+
 function MCT:ScheduleLaneQueuePump(lane, delayMs)
     local delay = math.max(0, tonumber(delayMs) or 0)
     if self._laneQueueScheduled[lane] then
         return
     end
 
+    local cb = lanePumpCallbacks[lane]
+    if not cb then
+        cb = function()
+            MCT._laneQueueScheduled[lane] = false
+            MCT:ProcessLaneQueue(lane)
+        end
+        lanePumpCallbacks[lane] = cb
+    end
+
     self._laneQueueScheduled[lane] = true
-    zo_callLater(function()
-        self._laneQueueScheduled[lane] = false
-        self:ProcessLaneQueue(lane)
-    end, delay)
+    zo_callLater(cb, delay)
+end
+
+-- MCT:ResetLaneQueues: drops every queued (not yet started) label.
+-- Called when leaving combat; the labels themselves are released by
+-- pool:ReleaseAllObjects().
+function MCT:ResetLaneQueues()
+    MCT._laneQueues = { left = {}, right = {}, center = {} }
+    MCT._laneQueueHeads = { left = 1, right = 1, center = 1 }
+    MCT._laneQueueTails = { left = 0, right = 0, center = 0 }
+    -- Pending pump timers will find empty queues and exit; keep the
+    -- scheduled flags so we don't stack duplicate timers.
+    MCT._laneQueueScheduled = MCT._laneQueueScheduled or { left = false, right = false, center = false }
+    MCT._laneNextOpenAt = { left = 0, right = 0, center = 0 }
+end
+
+-- ---------------------------------------------------------------
+-- Reusable animation timelines.
+-- ANIMATION_MANAGER:CreateTimeline() objects are never garbage
+-- collected by the ESO client, so the old approach (one new timeline
+-- per label shown) leaked memory steadily over long play sessions and
+-- cost a C-side allocation per label. Each pooled label now owns a
+-- small set of timelines, one per distinct "shape" (rise vs. lane and
+-- the phase offsets that are baked into a timeline at creation). Per
+-- play we only update offsets/durations, which are plain setters.
+-- ---------------------------------------------------------------
+local function OnLabelTimelineStop(tl)
+    local label = tl.mctLabel
+    -- Ignore stops of a timeline the label no longer owns (explicit Stop()
+    -- during release/reuse clears mctTimeline before stopping).
+    if not label or label.mctTimeline ~= tl then return end
+    label.mctTimeline = nil
+    if MCT.pool then
+        MCT.pool:ReleaseObject(label.mctPoolKey)
+    end
+end
+
+local function NewLabelTimeline(label)
+    local tl = AM:CreateTimeline()
+    tl.mctLabel = label
+    tl:SetHandler("OnStop", OnLabelTimelineStop)
+    return tl
+end
+
+-- Rise timeline: one translate + one alpha fade. Keyed by fade delay.
+local function GetRiseTimeline(label, fadeDelay)
+    local cache = label.mctRiseTimelines
+    if not cache then
+        cache = {}
+        label.mctRiseTimelines = cache
+    end
+    local entry = cache[fadeDelay]
+    if not entry then
+        local tl = NewLabelTimeline(label)
+        entry = {
+            tl = tl,
+            move = tl:InsertAnimation(ANIMATION_TRANSLATE, label, 0),
+            fade = tl:InsertAnimation(ANIMATION_ALPHA, label, fadeDelay),
+        }
+        entry.fade:SetAlphaValues(1, 0)
+        cache[fadeDelay] = entry
+    end
+    return entry
+end
+
+-- Lane timeline: three translate phases + alpha fade. Keyed by the
+-- phase offsets (only a few distinct values exist per settings profile).
+local function GetLaneTimeline(label, fadeDelay, firstPhase, secondPhase)
+    local cache = label.mctLaneTimelines
+    if not cache then
+        cache = {}
+        label.mctLaneTimelines = cache
+    end
+    local sig = fadeDelay .. ":" .. firstPhase .. ":" .. secondPhase
+    local entry = cache[sig]
+    if not entry then
+        local tl = NewLabelTimeline(label)
+        entry = {
+            tl = tl,
+            down = tl:InsertAnimation(ANIMATION_TRANSLATE, label, 0),
+            curve = tl:InsertAnimation(ANIMATION_TRANSLATE, label, firstPhase),
+            settle = tl:InsertAnimation(ANIMATION_TRANSLATE, label, firstPhase + secondPhase),
+            fade = tl:InsertAnimation(ANIMATION_ALPHA, label, fadeDelay),
+        }
+        entry.fade:SetAlphaValues(1, 0)
+        cache[sig] = entry
+    end
+    return entry
 end
 
 local function StartLaneAnimationNow(label, code, poolKey)
-    -- Stop any leftover timeline before reusing this label
-    if label.mctTimeline then
-        label.mctTimeline:Stop()
+    -- Stop any leftover timeline before reusing this label.
+    local old = label.mctTimeline
+    if old then
         label.mctTimeline = nil
+        old:Stop()
     end
 
     local sv = MCT.sv
@@ -1053,20 +1195,20 @@ local function StartLaneAnimationNow(label, code, poolKey)
     label:SetAlpha(1)
     label:SetScale(MCT:GetEffectiveUiScale())
 
-    -- Keep texture/icon in sync with the active label event.
+    -- Keep texture/icon in sync with the active label event
+    -- (SetEventTexture also lays the icons out).
     MCT:SetEventTexture(poolKey, label.mctAbilityId, label.mctEventCode, label.mctAbilityIds)
-    MCT:LayoutEventTexture(poolKey)
 
+    local isCC = CC_ANIM_CODES[code]
     local bx, by, jitter, rise
     if not sv.luiAnimStyle then
         -- CombatCloud / "Entered Combat" style: every event rises from the same
-        -- center anchor (ccx, ccy) so all text appears and floats up together,
-        -- exactly like ESO's native "Entered Combat" / "Left Combat" notification.
+        -- center anchor (ccx, ccy) so all text appears and floats up together.
         bx     = sv.ccx or 0
         by     = sv.ccy or 0
         jitter = sv.animJitter or 20
         rise   = sv.animRise   or 80
-    elseif CC_ANIM_CODES[code] then
+    elseif isCC then
         bx, by, jitter, rise = sv.ccx, sv.ccy, sv.animJitter or 20, sv.animRise or 80
     else
         local fn = ANIM_DATA[code]
@@ -1078,19 +1220,20 @@ local function StartLaneAnimationNow(label, code, poolKey)
     end
 
     local moveDur, fadeDur, fadeDelay = GetAnimationTimingForCode(sv, code)
+    local tl
 
-    local tl = ANIMATION_MANAGER:CreateTimeline()
-    label.mctTimeline = tl
-
-    if CC_ANIM_CODES[code] or not sv.luiAnimStyle then
+    if isCC or not sv.luiAnimStyle then
         -- Classic upward-rising animation: label floats up from its anchor with a horizontal jitter.
-        -- Used for CC/alerts (always) and all other event types when luiAnimStyle is false (default).
-        local move = tl:InsertAnimation(ANIMATION_TRANSLATE, label, 0)
-        move:SetTranslateOffsets(bx, by, bx + zo_random(-jitter, jitter), by - rise)
-        move:SetDuration(moveDur)
+        bx, by = tonumber(bx) or 0, tonumber(by) or 0
+        jitter = math.max(0, math.floor(tonumber(jitter) or 0))
+        rise = tonumber(rise) or 0
+        local entry = GetRiseTimeline(label, fadeDelay)
+        entry.move:SetTranslateOffsets(bx, by, bx + zo_random(-jitter, jitter), by - rise)
+        entry.move:SetDuration(moveDur)
+        entry.fade:SetDuration(fadeDur)
+        tl = entry.tl
     else
         -- Descending lane animation: start near top, fall, then ease outward on each side.
-        -- Only active when luiAnimStyle = true.
         local isRightLane = RIGHT_LANE_ANIM_CODES[code]
         local sideSign = isRightLane and 1 or -1
         local laneBaseX = tonumber(bx)
@@ -1098,8 +1241,7 @@ local function StartLaneAnimationNow(label, code, poolKey)
             laneBaseX = isRightLane and RIGHT_LANE_X or LEFT_LANE_X
         end
         local laneBaseY = tonumber(by) or LANE_CENTER_Y
-        local laneJitter = 10
-        local startX = laneBaseX + zo_random(-laneJitter, laneJitter)
+        local startX = laneBaseX + zo_random(-10, 10)
         local upperMidX = laneBaseX + (sideSign * zo_random(8, 18))
         local lowerMidX = laneBaseX + (sideSign * zo_random(24, 40))
         local endX = laneBaseX + (sideSign * zo_random(48, 72))
@@ -1113,39 +1255,23 @@ local function StartLaneAnimationNow(label, code, poolKey)
         local secondPhase = math.floor(moveDur * 0.32)
         local thirdPhase = math.max(140, moveDur - firstPhase - secondPhase)
 
-        local moveDown = tl:InsertAnimation(ANIMATION_TRANSLATE, label, 0)
-        moveDown:SetTranslateOffsets(startX, startY, upperMidX, upperMidY)
-        moveDown:SetDuration(firstPhase)
-
-        local moveCurve = tl:InsertAnimation(ANIMATION_TRANSLATE, label, firstPhase)
-        moveCurve:SetTranslateOffsets(upperMidX, upperMidY, lowerMidX, lowerMidY)
-        moveCurve:SetDuration(secondPhase)
-
-        local moveSettle = tl:InsertAnimation(ANIMATION_TRANSLATE, label, firstPhase + secondPhase)
-        moveSettle:SetTranslateOffsets(lowerMidX, lowerMidY, endX, endY)
-        moveSettle:SetDuration(thirdPhase)
+        local entry = GetLaneTimeline(label, fadeDelay, firstPhase, secondPhase)
+        entry.down:SetTranslateOffsets(startX, startY, upperMidX, upperMidY)
+        entry.down:SetDuration(firstPhase)
+        entry.curve:SetTranslateOffsets(upperMidX, upperMidY, lowerMidX, lowerMidY)
+        entry.curve:SetDuration(secondPhase)
+        entry.settle:SetTranslateOffsets(lowerMidX, lowerMidY, endX, endY)
+        entry.settle:SetDuration(thirdPhase)
+        entry.fade:SetDuration(fadeDur)
+        tl = entry.tl
     end
 
-    local fade = tl:InsertAnimation(ANIMATION_ALPHA, label, fadeDelay)
-    fade:SetAlphaValues(1, 0)
-    fade:SetDuration(fadeDur)
-
-    -- Guard against double-release: OnStop fires on natural end AND on explicit Stop()
-    local released = false
-    local function Release()
-        if not released then
-            released = true
-            label.mctTimeline = nil
-            MCT.pool:ReleaseObject(poolKey)
-        end
-    end
-
-    tl:InsertCallback(Release, tl:GetDuration())
-    tl:SetHandler("OnStop", Release)
-
+    -- OnLabelTimelineStop releases the label back to the pool when the
+    -- timeline finishes (or is stopped while still owned by the label).
+    label.mctTimeline = tl
     tl:PlayFromStart()
 
-    return GetLaneStaggerMs(sv, code)
+    return GetLaneStaggerMs(sv, code, moveDur)
 end
 
 function MCT:ProcessLaneQueue(lane)
@@ -1182,6 +1308,7 @@ function MCT:ProcessLaneQueue(lane)
         return
     end
 
+    item.label.mctQueued = nil
     local staggerMs = StartLaneAnimationNow(item.label, item.code, item.poolKey)
     self._laneNextOpenAt[lane] = now + staggerMs
 
@@ -1223,6 +1350,7 @@ function MCT:Animate(label, code, poolKey)
     -- Keep queued labels invisible until their lane slot opens.
     label:SetHidden(true)
     label.mctQueueToken = (tonumber(label.mctQueueToken) or 0) + 1
+    label.mctQueued = true
 
     local nextTail = (self._laneQueueTails[lane] or 0) + 1
     self._laneQueueTails[lane] = nextTail
@@ -1461,317 +1589,214 @@ end
 -- ---------------------------------------------------------------
 function MCT:ShowNotification(text, animCode, fontSize)
     if not MCT.pool then return end
-    if not MCT.sv or not MCT.sv.enabled then return end
+    local sv = MCT.sv
+    if not sv or not sv.enabled then return end
     MCT:MarkDisplayEvent()
     local label, key = MCT.pool:AcquireObject()
     if not label then return end
-    label:SetHidden(false)
-    label:SetAlpha(1)
-    label:SetFont(MCT:GetCachedFTNFont(fontSize or MCT.sv.fontSize or 32))
+    label:SetFont(MCT:GetCachedFTNFont(fontSize or sv.fontSize or 32))
     label:SetAnchor(MCT:GetAnchor(animCode))
     label:SetText(text)
-    label:SetScale(1.6)
+    label.mctAbilityId = nil
+    label.mctAbilityIds = nil
     label.mctEventCode = animCode
     MCT:Animate(label, animCode, key)
 end
 
-function MCT:ShowText(value, isCrit, isHeal, special, sID,unitId, isBlocked, abilityId, abilityIds)
+-- ---------------------------------------------------------------
+-- ShowText style tables.
+-- Previously ShowText was ~300 lines of near-identical if/elseif
+-- branches (and allocated an eventMap table on every call). The
+-- styles now live in data; ShowText picks the row and applies it.
+--
+-- Special (text/CC) rows:
+--   font   : sv key of the font size
+--   zo     : true → use the style's burst face (GetCachedZoCombatFont)
+--   rgb    : label vertex colour
+--   anchor : GetAnchor() code
+--   text   : fixed label text (wrapped in sv[color]); when nil the
+--            label shows `value` instead, followed by `mark`
+--            (or `critMark` when the hit was a crit)
+--   color  : sv key of the hex colour
+--   anim   : animation code (`critAnim` when crit, if present)
+-- ---------------------------------------------------------------
+local EVENT_CODE_FOR_SPECIAL = {
+    dodged = "dodge",
+    stunned = "stun",
+    feared = "fear",
+    charmed = "charm",
+    silenced = "silence",
+    disoriented = "disorient",
+    offbalanced = "offbalance",
+    immobilized = "dodge",
+}
+
+local SHIELDBREAK_SPEC = { font = "shieldbreakFontSize", rgb = { 0.6, 0.8, 1 }, anchor = "shieldbreak", color = "shieldbreakColor", anim = "shieldbreak" }
+
+-- CC / specials that landed on the player.
+local INCOMING_SPECIAL = {
+    dodged      = { font = "dodgeFontSize",      rgb = { 1, 1, 1 },     anchor = "dodge",      text = "DODGE",      color = "dodgedColor", anim = "dodge" },
+    stunned     = { font = "stunFontSize",       rgb = { 1, 0, 0 },     anchor = "stun",       text = "STUN",       color = "ccColor",     anim = "stun" },
+    feared      = { font = "fearFontSize",       rgb = { 1, 0, 1 },     anchor = "fear",       text = "FEAR",       color = "ccColor",     anim = "fear" },
+    charmed     = { font = "charmFontSize",      rgb = { 1, 0.6, 1 },   anchor = "charm",      text = "CHARM",      color = "ccColor",     anim = "charm" },
+    silenced    = { font = "silenceFontSize",    rgb = { 0.6, 0.6, 1 }, anchor = "silence",    text = "SILENCE",    color = "ccColor",     anim = "silence" },
+    disoriented = { font = "disorientFontSize",  rgb = { 1, 0.6, 0.4 }, anchor = "disorient",  text = "DISORIENT",  color = "ccColor",     anim = "disorient" },
+    offbalanced = { font = "offbalanceFontSize", rgb = { 0.4, 1, 0.8 }, anchor = "offbalance", text = "OFFBALANCE", color = "ccColor",     anim = "offbalance" },
+    immobilized = { font = "offbalanceFontSize", rgb = { 1, 0, 0 },     anchor = "dodge",      text = "IMMOBILIZED", color = "dodgedColor", anim = "dodge" },
+    shieldbreak = SHIELDBREAK_SPEC,
+}
+
+-- CC / specials the player applied to (or triggered on) another unit.
+local OUTGOING_SPECIAL = {
+    dodged      = { font = "dodgeFontSize",      rgb = { 1, 1, 1 },       anchor = "dodge",      text = "TARGET DODGE",       color = "dodgedColor", anim = "dodge" },
+    stunned     = { font = "offbalanceFontSize", rgb = { 1, 0, 0 },       anchor = "stun",       text = "TARGET STUN",        color = "ccColor",     anim = "stun" },
+    feared      = { font = "offbalanceFontSize", rgb = { 1, 0, 1 },       anchor = "fear",       text = "TARGET FEAR",        color = "ccColor",     anim = "fear" },
+    charmed     = { font = "offbalanceFontSize", rgb = { 1, 0.6, 1 },     anchor = "charm",      text = "TARGET CHARM",       color = "ccColor",     anim = "charm" },
+    silenced    = { font = "offbalanceFontSize", rgb = { 0.6, 0.6, 1 },   anchor = "silence",    text = "TARGET SILENCE",     color = "ccColor",     anim = "silence" },
+    disoriented = { font = "offbalanceFontSize", rgb = { 1, 0.6, 0.4 },   anchor = "disorient",  text = "TARGET DISORIENT",   color = "ccColor",     anim = "disorient" },
+    offbalanced = { font = "offbalanceFontSize", rgb = { 0.4, 1, 0.8 },   anchor = "offbalance", text = "TARGET OFFBALANCE",  color = "ccColor",     anim = "offbalance" },
+    immobilized = { font = "offbalanceFontSize", rgb = { 1, 0, 0 },       anchor = "dodge",      text = "TARGET IMMOBILIZED", color = "dodgedColor", anim = "dodge" },
+    burst       = { font = "burstFontSize", zo = true, rgb = { 1, 0.6, 0.1 }, anchor = "burst", color = "burstColor", mark = "!", anim = "burst" },
+    dot         = { font = "offbalanceFontSize", rgb = { 0.8, 0.8, 0.8 }, anchor = "dot", color = "dotColor", critMark = "!", anim = "dot", critAnim = "dotCrit" },
+    shieldbreak = SHIELDBREAK_SPEC,
+}
+
+-- Numeric rows: { font, anchor, prefix, postfix, colorKey, anim }.
+-- Index with [direction][variant] where variant is one of
+-- critHeal / critBlocked / crit / heal / blocked / hit.
+local function NumStyle(font, anchor, prefix, postfix, color, anim)
+    return { font = font, anchor = anchor, prefix = prefix, postfix = postfix, color = color, anim = anim }
+end
+
+local NUMBER_STYLES = {
+    incoming = {
+        critHeal    = NumStyle("healingFontSize", "healing",     "+",         "!", "criticalHealingColor", "healingCrit"),
+        critBlocked = NumStyle("damageFontSize",  "damageTaken", "BLOCKED *", "*", "damageTakenCritColor", "damageTakenCrit"),
+        crit        = NumStyle("damageFontSize",  "damageTaken", "",          "!", "damageTakenCritColor", "damageTakenCrit"),
+        heal        = NumStyle("healingFontSize", "healing",     "+",         "",  "healingColor",         "healing"),
+        blocked     = NumStyle("damageFontSize",  "damageTaken", "BLOCKED *", "*", "damageTakenColor",     "damageTaken"),
+        hit         = NumStyle("damageFontSize",  "damageTaken", "",          "",  "damageTakenColor",     "damageTaken"),
+    },
+    outgoing = {
+        critHeal    = NumStyle("healingFontSize", "healing", "+",         "!", "criticalHealingColor", "healingCrit"),
+        critBlocked = NumStyle("damageFontSize",  "damage",  "",          "!", "criticalColor",        "damageCrit"),
+        crit        = NumStyle("damageFontSize",  "damage",  "",          "!", "criticalColor",        "damageCrit"),
+        heal        = NumStyle("healingFontSize", "healing", "+",         "",  "healingColor",         "healing"),
+        blocked     = NumStyle("damageFontSize",  "damage",  "BLOCKED *", "*", "damageColor",          "damage"),
+        hit         = NumStyle("damageFontSize",  "damage",  "",          "",  "damageColor",          "damage"),
+    },
+    self = {
+        critHeal    = NumStyle("healingFontSize", "healing", "+", "!", "criticalHealingColor", "healingCrit"),
+        critBlocked = NumStyle("damageFontSize",  "damage",  "",  "!", "criticalColor",        "damageTakenCrit"),
+        crit        = NumStyle("damageFontSize",  "damage",  "",  "!", "criticalColor",        "damageTakenCrit"),
+        heal        = NumStyle("healingFontSize", "healing", "+", "",  "healingColor",         "healing"),
+        blocked     = NumStyle("damageFontSize",  "damage",  "",  "",  "damageColor",          "damageTaken"),
+        hit         = NumStyle("damageFontSize",  "damage",  "",  "",  "damageColor",          "damageTaken"),
+    },
+}
+
+local function ApplySpecialStyle(label, key, spec, value, isCrit, eventCode)
+    local sv = MCT.sv
+    if spec.zo then
+        label:SetFont(MCT:GetCachedZoCombatFont(sv[spec.font]))
+    else
+        label:SetFont(MCT:GetCachedFTNFont(sv[spec.font]))
+    end
+    local rgb = spec.rgb
+    label:SetColor(rgb[1], rgb[2], rgb[3], 1)
+    label:SetAnchor(MCT:GetAnchor(spec.anchor))
+
+    local text
+    if spec.text then
+        text = MCT:ColorTextCached(sv[spec.color], spec.text)
+    else
+        local mark = (isCrit and spec.critMark) or spec.mark or ""
+        text = "|c" .. tostring(sv[spec.color]) .. tostring(value) .. mark .. "|r"
+    end
+    SetStyledLabelText(label, text, eventCode)
+
+    MCT:Animate(label, (isCrit and spec.critAnim) or spec.anim, key)
+end
+
+function MCT:ShowText(value, isCrit, isHeal, special, sID, unitId, isBlocked, abilityId, abilityIds)
+    local pool = MCT.pool
+    if not pool then return end
+
+    -- Classify direction relative to the player before touching the pool.
+    local playerId = MCT._playerUnitId
+    local targetIsPlayer = (unitId == playerId)
+    local sourceIsPlayer = (sID == playerId)
+    local direction
+    if targetIsPlayer and not sourceIsPlayer then
+        direction = "incoming"
+    elseif sourceIsPlayer and not targetIsPlayer then
+        direction = "outgoing"
+    elseif sourceIsPlayer and targetIsPlayer then
+        direction = "self"
+    else
+        return -- event doesn't involve the player; nothing to show
+    end
+
     MCT:MarkDisplayEvent()
-
-    local label, key = MCT.pool:AcquireObject()
+    local label, key = pool:AcquireObject()
     if not label then return end
-    local playerId = MCT:GetPlayerUnitId()
-    local eventCode = special
-    local abilitySuffix = MCT:GetAbilityNameSuffix(abilityId, abilityIds)
 
+    local eventCode = special
     if not eventCode or eventCode == "" then
         if isHeal then
             eventCode = "healing"
-        elseif unitId == playerId and sID ~= playerId then
+        elseif direction == "incoming" then
             eventCode = "damageTaken"
         else
             eventCode = "damage"
         end
     end
-
-    local eventMap = {
-        dodged = "dodge",
-        stunned = "stun",
-        feared = "fear",
-        charmed = "charm",
-        silenced = "silence",
-        disoriented = "disorient",
-        offbalanced = "offbalance",
-        immobilized = "dodge",
-    }
-    eventCode = eventMap[eventCode] or eventCode
+    eventCode = EVENT_CODE_FOR_SPECIAL[eventCode] or eventCode
 
     label.mctAbilityId = abilityId
-    label.mctAbilityIds = abilityIds or (abilityId and { abilityId } or nil)
+    label.mctAbilityIds = abilityIds
     label.mctEventCode = eventCode
 
-    if unitId == playerId and sID ~= playerId then
-        -- Anchor to center if self
-        label:SetHidden(false)
-    label:SetAlpha(1)
-    if special == "dodged" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.dodgeFontSize))
-        label:SetColor(1, 1, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("dodge"))
-        SetStyledLabelText(label, string.format("|c%sDODGE|r", MCT.sv.dodgedColor), eventCode)
-        MCT:Animate(label, "dodge", key)
-    elseif special == "stunned" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.stunFontSize))
-        label:SetColor(1, 0, 0, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("stun"))
-        SetStyledLabelText(label, string.format("|c%sSTUN|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "stun", key)
-    elseif special == "feared" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.fearFontSize))
-        label:SetColor(1, 0, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("fear"))
-        SetStyledLabelText(label, string.format("|c%sFEAR|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "fear", key)
-    elseif special == "charmed" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.charmFontSize))
-        label:SetColor(1, 0.6, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("charm"))
-        SetStyledLabelText(label, string.format("|c%sCHARM|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "charm", key)
-    elseif special == "silenced" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.silenceFontSize))
-        label:SetColor(0.6, 0.6, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("silence"))
-        SetStyledLabelText(label, string.format("|c%sSILENCE|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "silence", key)
-    elseif special == "disoriented" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.disorientFontSize))
-        label:SetColor(1, 0.6, 0.4, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("disorient"))
-        SetStyledLabelText(label, string.format("|c%sDISORIENT|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "disorient", key)
-    elseif special == "offbalanced" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(0.4, 1, 0.8, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("offbalance"))
-        SetStyledLabelText(label, string.format("|c%sOFFBALANCE|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "offbalance", key)
-    
-    elseif special == "shieldbreak" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.shieldbreakFontSize))
-        label:SetColor(0.6, 0.8, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("shieldbreak"))
-        SetStyledLabelText(label, string.format("|c%s%s|r", MCT.sv.shieldbreakColor, value), eventCode)
-        MCT:Animate(label, "shieldbreak", key)
-    elseif special == "immobilized" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(1, 0, 0, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("dodge"))
-        SetStyledLabelText(label, string.format("|c%sIMMOBILIZED|r", MCT.sv.dodgedColor), eventCode)
-        MCT:Animate(label, "dodge", key)
-    else
-        if isCrit then
-            if isHeal then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.healingFontSize))
-                label:SetAnchor(GetAnchor("healing"))
-                SetStyledLabelText(label, string.format("|c%s+%s!|r%s", MCT.sv.criticalHealingColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "healingCrit", key)
-            elseif not isHeal and isBlocked then
-                label:SetAnchor(GetAnchor("damageTaken"))
-                SetStyledLabelText(label, string.format("|c%sBLOCKED *%s*|r%s", MCT.sv.damageTakenCritColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageTakenCrit", key)
-            else
-                label:SetAnchor(GetAnchor("damageTaken"))
-                SetStyledLabelText(label, string.format("|c%s%s!|r%s", MCT.sv.damageTakenCritColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageTakenCrit", key)
-            end
+    -- ---- Text / CC specials ----
+    if special and special ~= "" then
+        local spec
+        if direction == "outgoing" then
+            spec = OUTGOING_SPECIAL[special]
         else
-            if isHeal then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.healingFontSize))
-                label:SetAnchor(GetAnchor("healing"))
-                SetStyledLabelText(label, string.format("|c%s+%s|r%s", MCT.sv.healingColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "healing", key)
-
-            elseif not isHeal and isBlocked then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                label:SetAnchor(GetAnchor("damageTaken"))
-                SetStyledLabelText(label, string.format("|c%sBLOCKED *%s*|r%s", MCT.sv.damageTakenColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageTaken", key)
-            else
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                label:SetAnchor(GetAnchor("damageTaken"))
-                SetStyledLabelText(label, string.format("|c%s%s|r%s", MCT.sv.damageTakenColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageTaken", key)
-            end
+            -- Incoming, or a self-applied effect: the player is the one affected.
+            spec = INCOMING_SPECIAL[special] or OUTGOING_SPECIAL[special]
         end
+        if spec then
+            ApplySpecialStyle(label, key, spec, value, isCrit, eventCode)
+            return
+        end
+        -- Unknown special: fall through and display as a number.
     end
 
-elseif unitId ~= playerId and sID == playerId then
-        -- Anchor to reticle if not self
-        label:SetHidden(false)
-    label:SetAlpha(1)
-
-    if special == "dodged" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.dodgeFontSize))
-        label:SetColor(1, 1, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("dodge"))
-        SetStyledLabelText(label, string.format("|c%sTARGET DODGE|r", MCT.sv.dodgedColor), eventCode)
-        MCT:Animate(label, "dodge", key)
-    elseif special == "burst" then
-        label:SetFont(MCT:GetCachedZoCombatFont(MCT.sv.burstFontSize))
-        label:SetColor(1, 0.6, 0.1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("burst"))
-        SetStyledLabelText(label, string.format("|c%s%s!|r", MCT.sv.burstColor, value), eventCode)
-        MCT:Animate(label, "burst", key)
-    elseif special == "stunned" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(1, 0, 0, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("stun"))
-        SetStyledLabelText(label, string.format("|c%sTARGET STUN|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "stun", key)
-    elseif special == "dot" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(0.8, 0.8, 0.8, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("dot"))
-        if isCrit then
-            SetStyledLabelText(label, string.format("|c%s%s!|r", MCT.sv.dotColor, value), eventCode)
-            MCT:Animate(label, "dotCrit", key)
-        else
-            SetStyledLabelText(label, string.format("|c%s%s|r", MCT.sv.dotColor, value), eventCode)
-            MCT:Animate(label, "dot", key)
-        end
-    elseif special == "immobilized" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(1, 0, 0, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("dodge"))
-        SetStyledLabelText(label, string.format("|c%sTARGET IMMOBILIZED|r", MCT.sv.dodgedColor), eventCode)
-        MCT:Animate(label, "dodge", key)
-    elseif special == "feared" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(1, 0, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("fear"))
-        SetStyledLabelText(label, string.format("|c%sTARGET FEAR|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "fear", key)
-    elseif special == "charmed" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(1, 0.6, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("charm"))
-        SetStyledLabelText(label, string.format("|c%sTARGET CHARM|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "charm", key)
-    elseif special == "silenced" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(0.6, 0.6, 1, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("silence"))
-        SetStyledLabelText(label, string.format("|c%sTARGET SILENCE|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "silence", key)
-    elseif special == "disoriented" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(1, 0.6, 0.4, 1)
-        label:SetScale(1.8)
-        label:SetAnchor(GetAnchor("disorient"))
-        SetStyledLabelText(label, string.format("|c%sTARGET DISORIENT|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "disorient", key)
-    elseif special == "offbalanced" then
-        label:SetFont(MCT:GetCachedFTNFont(MCT.sv.offbalanceFontSize))
-        label:SetColor(0.4, 1, 0.8, 1)
-        label:SetScale(1.8)
-        
-        label:SetAnchor(GetAnchor("offbalance") )
-        SetStyledLabelText(label, string.format("|c%sTARGET OFFBALANCE|r", MCT.sv.ccColor), eventCode)
-        MCT:Animate(label, "offbalance", key)
+    -- ---- Numeric damage / healing ----
+    local variant
+    if isCrit then
+        variant = isHeal and "critHeal" or (isBlocked and "critBlocked" or "crit")
     else
+        variant = isHeal and "heal" or (isBlocked and "blocked" or "hit")
+    end
+    local style = NUMBER_STYLES[direction][variant]
+    local sv = MCT.sv
+
+    if direction ~= "incoming" then
         if isHeal then
             label:SetColor(0.2, 1, 0.2, 1)
         else
             label:SetColor(1, 0.2, 0.2, 1)
         end
-        label:SetScale(1.8)
-        if isCrit then
-            if isHeal then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.healingFontSize))
-                label:SetAnchor(GetAnchor("healing"))
-                SetStyledLabelText(label, string.format("|c%s+%s!|r%s", MCT.sv.criticalHealingColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "healingCrit", key)
-            else
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                label:SetAnchor(GetAnchor("damage"))
-                SetStyledLabelText(label, string.format("|c%s%s!|r%s", MCT.sv.criticalColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageCrit", key)
-            end
-        else
-            if isHeal then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.healingFontSize))
-                label:SetAnchor(GetAnchor("healing"))
-                SetStyledLabelText(label, string.format("|c%s+%s|r%s", MCT.sv.healingColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "healing", key)
-            elseif not isHeal and isBlocked then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                  label:SetAnchor(GetAnchor("damage"))
-                SetStyledLabelText(label, string.format("|c%sBLOCKED *%s*|r%s", MCT.sv.damageColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damage", key)  
-            else
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                label:SetAnchor(GetAnchor("damage"))
-                SetStyledLabelText(label, string.format("|c%s%s|r%s", MCT.sv.damageColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damage", key)
-            end
-        end
     end
-elseif unitId == playerId and sID == playerId then
-    label:SetHidden(false)
-    label:SetAlpha(1)
-
-    if isHeal then
-            label:SetColor(0.2, 1, 0.2, 1)
-        else
-            label:SetColor(1, 0.2, 0.2, 1)
-        end
-        label:SetScale(1.8)
-        if isCrit then
-            if isHeal then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.healingFontSize))
-                label:SetAnchor(GetAnchor("healing"))
-                SetStyledLabelText(label, string.format("|c%s+%s!|r%s", MCT.sv.criticalHealingColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "healingCrit", key)
-            else
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                label:SetAnchor(GetAnchor("damage"))
-                SetStyledLabelText(label, string.format("|c%s%s!|r%s", MCT.sv.criticalColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageTakenCrit", key)
-            end
-        else
-            if isHeal then
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.healingFontSize))
-                label:SetAnchor(GetAnchor("healing"))
-                SetStyledLabelText(label, string.format("|c%s+%s|r%s", MCT.sv.healingColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "healing", key)
-            else
-                label:SetFont(MCT:GetCachedFTNFont(MCT.sv.damageFontSize))
-                label:SetAnchor(GetAnchor("damage"))
-                SetStyledLabelText(label, string.format("|c%s%s|r%s", MCT.sv.damageColor, FormatShortNumber(value), abilitySuffix), eventCode)
-                MCT:Animate(label, "damageTaken", key)
-            end
-        end
-else
-    MCT.pool:ReleaseObject(key)   
-end
+    label:SetFont(MCT:GetCachedFTNFont(sv[style.font]))
+    label:SetAnchor(MCT:GetAnchor(style.anchor))
+    SetStyledLabelText(label,
+        "|c" .. tostring(sv[style.color]) .. style.prefix .. FormatShortNumber(value) .. style.postfix .. "|r"
+            .. MCT:GetAbilityNameSuffix(abilityId, abilityIds),
+        eventCode)
+    MCT:Animate(label, style.anim, key)
 end
 -------------------------------------------------------
 -- Tracking and combat pipeline moved to:
@@ -3266,8 +3291,7 @@ end
 --   6. Register all combat event listeners (Combat.lua).
 --   7. Register slash commands.
 --   8. Register the settings panel (requires LAM-2.0).
---   9. Register EVENT_PLAYER_COMBAT_STATE_CHANGED to clear all
---      tracking tables when leaving combat (memory hygiene).
+--   (Leaving-combat cleanup lives in Combat.lua: MCT:ResetCombatTracking.)
 -- ---------------------------------------------------------------
 function MCT:Initialize()
     MCT.sv = ZO_SavedVars:NewAccountWide("MCT_Saved", 1, nil, MCT.defaults)
@@ -3290,30 +3314,9 @@ function MCT:Initialize()
     MCT:InitSettingsPanel()
     MCT:RegisterPresetCommands()
 
-    -- Purge per-target tracking tables when leaving combat to prevent
-    -- unbounded growth of the burstTargets, shields, dps, and merge tables.
-    -- Also clears all visible floating labels so nothing lingers after a fight.
-    EM:RegisterForEvent(MCT.name .. "Combat", EVENT_PLAYER_COMBAT_STATE_CHANGED, function(_, inCombat)
-        if not inCombat then
-            if MCT.pool and MCT.pool.ReleaseAllObjects then
-                MCT.pool:ReleaseAllObjects()
-            end
-            MCT.burstTargets = {}
-            MCT.shields      = {}
-            MCT.dps          = {}
-            MCT.merge        = {}
-            MCT.mergeTimers  = {}
-            MCT._laneQueues = { left = {}, right = {}, center = {} }
-            MCT._laneQueueHeads = { left = 1, right = 1, center = 1 }
-            MCT._laneQueueTails = { left = 0, right = 0, center = 0 }
-            MCT._laneQueueScheduled = { left = false, right = false, center = false }
-            MCT._laneNextOpenAt = { left = 0, right = 0, center = 0 }
-            MCT._displayRateWindowStart = 0
-            MCT._displayRateCount = 0
-            MCT._eventTextureSuppressedUntil = 0
-            MCT.lastPruneMs  = 0
-        end
-    end)
+    -- Per-fight cleanup (tracking tables, lane queues, visible labels) runs
+    -- from the EVENT_PLAYER_COMBAT_STATE handler in MyCombatText.Combat.lua
+    -- via MCT:ResetCombatTracking().
 end
 
 -- Bootstrap: wait for EVENT_ADD_ON_LOADED for this addon's name so that
