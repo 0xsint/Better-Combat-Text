@@ -282,9 +282,10 @@ function MCT:InitSettingsPanel()
                 .. "LUI Enhanced: vibrant and dramatic (recommended)\n"
                 .. "LUI Classic: calmer LUI look\n"
                 .. "Minimal: only the essentials\n"
-                .. "Detailed: everything on",
-            choices = { "LUI Enhanced", "LUI Classic", "Minimal", "Detailed" },
-            choicesValues = { "LUI_ENHANCED", "LUI_CLASSIC", "MINIMAL", "DETAILED" },
+                .. "Detailed: everything on\n"
+                .. "Sweetheart: pastel, handwritten and bouncy, with hearts and sparkles",
+            choices = { "LUI Enhanced", "LUI Classic", "Minimal", "Detailed", "Sweetheart (cute)" },
+            choicesValues = { "LUI_ENHANCED", "LUI_CLASSIC", "MINIMAL", "DETAILED", "SWEETHEART" },
             getFunc = function() return MCT.Presets.current or "LUI_ENHANCED" end,
             setFunc = function(v) MCT:ApplyPreset(v) end,
             warning = "Replaces your current customizations.",
@@ -375,7 +376,8 @@ function MCT:InitSettingsPanel()
             {
                 type = "dropdown",
                 name = "Text style",
-                tooltip = "Default: plain combat text\nHearts / Hearts (White): heart row above each label\n"
+                tooltip = "Default: plain combat text\nSweetheart: handwritten text framed by glossy hearts and sparkles, softer wording\n"
+                    .. "Hearts / Hearts (White): heart row above each label\n"
                     .. "Imperial: [ bracketed ]\nArcane: rune wrapper\nWar Drum: << heavy frame >>",
                 choices = fontStyleLabels,
                 choicesValues = fontStyleValues,
@@ -394,6 +396,9 @@ function MCT:InitSettingsPanel()
             Percent("gamepadFontMultiplier", "Gamepad font boost (%)", 100, 180, 5, nil, { disabled = notConsole }),
 
             Header("Animation"),
+            Check("popAnimation", "Bouncy pop",
+                "Labels squish in, bounce slightly too big, then settle. Crits bounce harder. (Floating mode only.)",
+                { disabled = function() return MCT.sv.luiAnimStyle == true end }),
             Check("luiAnimStyle", "Falling lanes",
                 "On: numbers fall down left/right lanes (LUI style).\nOff: numbers float upward from their position."),
             Slider("animDuration", "Duration (ms)", 400, 2000, 50, "How long each label stays on screen."),

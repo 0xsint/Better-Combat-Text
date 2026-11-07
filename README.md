@@ -83,7 +83,7 @@ Floating labels are not created per-event; `MCT:InitPool()` pre-allocates a fixe
 - **Alliance Points / Experience / Champion Points gain** notifications (buffered/batched).
 - **Mitigation events**: miss, immune, parried, reflected.
 - **Energize / drain** display (opt-in, off by default).
-- **Four visual presets** (`LUI_ENHANCED`, `LUI_CLASSIC`, `MINIMAL`, `DETAILED`) for one-command style switching.
+- **Five visual presets** (`LUI_ENHANCED`, `LUI_CLASSIC`, `MINIMAL`, `DETAILED`, `SWEETHEART`) for one-command style switching.
 - **Full LibAddonMenu-2.0 settings panel** exposing colors, font sizes, position offsets, thresholds, and behavior toggles for every category above.
 - **PvP-only mode**, reticle anchoring, gamepad-aware UI scaling, and a "performance mode" that throttles icons/textures during heavy combat.
 
@@ -93,7 +93,7 @@ Floating labels are not created per-event; `MCT:InitPool()` pre-allocates a fixe
 |---|---|
 | `/mct` | Open the settings panel. |
 | `/mct test` | Preview sample labels (damage, crit, heal, damage taken, stun, burst, alert) so you can check styling out of combat. |
-| `/mct preset <name>` | Switch to a preset: `LUI_ENHANCED`, `LUI_CLASSIC`, `MINIMAL`, `DETAILED`. |
+| `/mct preset <name>` | Switch to a preset: `LUI_ENHANCED`, `LUI_CLASSIC`, `MINIMAL`, `DETAILED`, `SWEETHEART`. |
 | `/mct presets` | List all available preset names. |
 | `/mct help` | Print command reference to chat. |
 | `/bct testlabel <value> <code>` | Spawn a test label (e.g. `damage`, `damageCrit`, `healing`, `burst`, `shieldbreak`, `dodge`, `dot`, `stun`, `fear`, `charm`, `silence`, `disorient`, `offbalance`, `resourceRestore`). |
@@ -108,6 +108,7 @@ Floating labels are not created per-event; `MCT:InitPool()` pre-allocates a fixe
 | `LUI_CLASSIC` | Quieter LUI style | 28–48pt | 1000ms | 150px | 80px | All events |
 | `MINIMAL` | Critical info only | 24–42pt | 700ms | 100px | 50px | Damage/heal/crit/key CC only — dodges, DoTs, resources, icons suppressed |
 | `DETAILED` | Maximum awareness | 30–52pt | 1100ms | 170px | 90px | Every event type, icons on |
+| `SWEETHEART` | Pastel & cute | 34–58pt, handwritten | 1300ms | 140px | 70px | Every event type; glossy hearts frame heals/crits, sparkles frame damage, softer wording ("dizzy~", "oopsie~"), bouncy pop animation |
 
 See [FEATURES_GUIDE.md](/c:/Users/Admin/AppData/Local/Elder Scrolls Online/pccert/CachedData/AddOnsManaged/MyCombatText/FEATURES_GUIDE.md) for the full feature walkthrough, animation test codes, color-code reference, and troubleshooting FAQ.
 

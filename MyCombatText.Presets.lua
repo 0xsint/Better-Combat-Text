@@ -104,6 +104,8 @@ MCT.Presets = {
         
         -- Animation: full LUI style with long duration (1200ms) and
         -- high rise (180px) for a fluid waterfall effect.
+        combatFontStyle = "DEFAULT",
+        popAnimation = false,
         luiAnimStyle = true,
         animDuration = 1200,
         animRise = 180,
@@ -197,6 +199,8 @@ MCT.Presets = {
         showResourceRestore = true,
         critOnly = false,
         
+        combatFontStyle = "DEFAULT",
+        popAnimation = false,
         luiAnimStyle = true,
         animDuration = 1000,
         animRise = 150,
@@ -289,6 +293,8 @@ MCT.Presets = {
         showDots = false,
         showResourceRestore = false,        showOverhealing = false,        critOnly = false,
         
+        combatFontStyle = "DEFAULT",
+        popAnimation = false,
         luiAnimStyle = false,
         animDuration = 700,
         animRise = 100,
@@ -382,6 +388,8 @@ MCT.Presets = {
         showOverhealing = true,
         critOnly = false,
         
+        combatFontStyle = "DEFAULT",
+        popAnimation = false,
         luiAnimStyle = true,
         animDuration = 1100,
         animRise = 170,
@@ -408,6 +416,95 @@ MCT.Presets = {
         doty = 0,
         resourcex = 150,
         resourcey = 0,
+        showEventTextures = true,
+        mergeWindowMs = 500,
+    },
+    -- --------------------------------------------------------------
+    -- SWEETHEART: pastel, handwritten and bouncy. Glossy hearts frame
+    -- heals and crits, sparkles frame damage, wording is softer
+    -- ("dizzy~", "oopsie~", "phew~ all safe").
+    -- --------------------------------------------------------------
+    SWEETHEART = {
+        enabled = true,
+        combatFontStyle = "CUTE",
+        popAnimation = true,
+        enableHeartTextures = false,
+
+        -- Pastel palette (light enough to read over busy scenes; the
+        -- soft shadow keeps edges crisp).
+        damageColor = "ffb3d9",            -- bubblegum pink
+        criticalColor = "ff7eb6",          -- hot pink
+        dotColor = "d9b8ff",               -- lavender
+        burstColor = "ff8fc7",
+        shieldbreakColor = "a8e6ff",       -- sky blue
+        damageTakenColor = "ffc4a3",       -- peach
+        damageTakenCritColor = "ff9b8a",   -- coral
+        healingColor = "a8f0c6",           -- mint
+        criticalHealingColor = "7fe8b0",
+        overhealingColor = "c8f7e1",
+        resourceRestoreColor = "b5e3ff",
+        energizeColor = "b5e3ff",
+        drainColor = "ffd6a5",
+        ccColor = "e3b8ff",
+        dodgedColor = "fff0a8",            -- butter yellow
+        missColor = "fff0f5",
+        immuneColor = "ffb3c6",
+        parriedColor = "c9d6ff",
+        reflectedColor = "ffd1a8",
+        alertColor = "fff3a8",
+        combatStateColor = "ffe4f2",
+        lowHealthColor = "ff9eb5",
+        lowMagickaColor = "a8c8ff",
+        lowStaminaColor = "b8f2c2",
+        ultimateReadyColor = "f6c8ff",
+        potionReadyColor = "e6b3ff",
+        experiencePointsColor = "c8d4ff",
+        championPointsColor = "fff0b3",
+        alliancePointsColor = "c2f0c2",
+        reticleHighlightColor = "ff8fc7",
+
+        -- The handwritten face reads a little small, so sizes are bumped.
+        fontSize = 34,
+        damageFontSize = 44,
+        healingFontSize = 42,
+        burstFontSize = 58,
+        shieldbreakFontSize = 42,
+        damageTakenFontSize = 40,
+        dodgeFontSize = 40,
+        stunFontSize = 42,
+        fearFontSize = 42,
+        charmFontSize = 42,
+        silenceFontSize = 42,
+        disorientFontSize = 42,
+        offbalanceFontSize = 40,
+        dotFontSize = 36,
+        resourceRestoreFontSize = 34,
+        overhealingFontSize = 34,
+
+        showDamage = true,
+        showHealing = true,
+        showDamageTaken = true,
+        showDodges = true,
+        showStuns = true,
+        showFears = true,
+        showCharms = true,
+        showSilences = true,
+        showDisorients = true,
+        showOffbalances = true,
+        showDots = true,
+        showResourceRestore = true,
+        showOverhealing = true,
+        critOnly = false,
+
+        -- Gentle float-up with a bouncy pop, a touch slower so it can be enjoyed.
+        luiAnimStyle = false,
+        animDuration = 1300,
+        animRise = 140,
+        animJitter = 70,
+        laneQueueStaggerPercent = 6,
+
+        pvpOnly = false,
+        anchorToReticle = false,
         showEventTextures = true,
         mergeWindowMs = 500,
     },

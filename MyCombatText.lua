@@ -99,6 +99,7 @@ MCT.defaults = {
     showDisorients = true,
     showOffbalances = true,
     showImmobilizes = true,
+    popAnimation = false,  -- Bouncy scale "pop" when a label appears (Sweetheart preset turns it on).
     showDots = true,
     showResourceRestore = true,
     showOverhealing = true,
@@ -1158,6 +1159,34 @@ local function GetRiseTimeline(label, fadeDelay)
     return entry
 end
 
+-- Pop timeline: the rise timeline plus a two-step scale "boing"
+-- (squish in -> overshoot -> settle). Used by the bouncy pop animation.
+local POP_GROW_MS, POP_SETTLE_MS = 130, 170
+
+local function GetPopTimeline(label, fadeDelay)
+    local cache = label.mctPopTimelines
+    if not cache then
+        cache = {}
+        label.mctPopTimelines = cache
+    end
+    local entry = cache[fadeDelay]
+    if not entry then
+        local tl = NewLabelTimeline(label)
+        entry = {
+            tl = tl,
+            move = tl:InsertAnimation(ANIMATION_TRANSLATE, label, 0),
+            grow = tl:InsertAnimation(ANIMATION_SCALE, label, 0),
+            settle = tl:InsertAnimation(ANIMATION_SCALE, label, POP_GROW_MS),
+            fade = tl:InsertAnimation(ANIMATION_ALPHA, label, fadeDelay),
+        }
+        entry.grow:SetDuration(POP_GROW_MS)
+        entry.settle:SetDuration(POP_SETTLE_MS)
+        entry.fade:SetAlphaValues(1, 0)
+        cache[fadeDelay] = entry
+    end
+    return entry
+end
+
 -- Lane timeline: three translate phases + alpha fade. Keyed by the
 -- phase offsets (only a few distinct values exist per settings profile).
 local function GetLaneTimeline(label, fadeDelay, firstPhase, secondPhase)
@@ -1192,9 +1221,10 @@ local function StartLaneAnimationNow(label, code, poolKey)
     end
 
     local sv = MCT.sv
+    local baseScale = MCT:GetEffectiveUiScale()
     label:SetHidden(false)
     label:SetAlpha(1)
-    label:SetScale(MCT:GetEffectiveUiScale())
+    label:SetScale(baseScale)
 
     -- Keep texture/icon in sync with the active label event
     -- (SetEventTexture also lays the icons out).
@@ -1228,7 +1258,16 @@ local function StartLaneAnimationNow(label, code, poolKey)
         bx, by = tonumber(bx) or 0, tonumber(by) or 0
         jitter = math.max(0, math.floor(tonumber(jitter) or 0))
         rise = tonumber(rise) or 0
-        local entry = GetRiseTimeline(label, fadeDelay)
+        local entry
+        if sv.popAnimation and ANIMATION_SCALE then
+            -- Bouncy pop: squish in, overshoot, settle — crits bounce harder.
+            entry = GetPopTimeline(label, fadeDelay)
+            local peak = CRIT_ANIM_CODES[code] and 1.45 or 1.22
+            entry.grow:SetScaleValues(baseScale * 0.35, baseScale * peak)
+            entry.settle:SetScaleValues(baseScale * peak, baseScale)
+        else
+            entry = GetRiseTimeline(label, fadeDelay)
+        end
         entry.move:SetTranslateOffsets(bx, by, bx + zo_random(-jitter, jitter), by - rise)
         entry.move:SetDuration(moveDur)
         entry.fade:SetDuration(fadeDur)
@@ -1435,8 +1474,8 @@ local function ParseArgs(text)
 end
 
 -- Applies the selected text style decoration consistently to all combat labels.
-local function SetStyledLabelText(label, text, eventCode)
-    label:SetText(MCT:StylizeDisplayText(text, eventCode))
+local function SetStyledLabelText(label, text, eventCode, isCrit)
+    label:SetText(MCT:StylizeDisplayText(text, eventCode, isCrit))
 end
 -- ---------------------------------------------------------------
 -- initSlashCommands: registers development/debug slash commands.
@@ -1603,7 +1642,7 @@ function MCT:ShowNotification(text, animCode, fontSize)
     if not label then return end
     label:SetFont(MCT:GetCachedFTNFont(fontSize or sv.fontSize or 32))
     label:SetAnchor(MCT:GetAnchor(animCode))
-    label:SetText(text)
+    label:SetText(MCT:StylizeDisplayText(text, animCode))
     label.mctAbilityId = nil
     label.mctAbilityIds = nil
     label.mctEventCode = animCode
@@ -1721,7 +1760,7 @@ local function ApplySpecialStyle(label, key, spec, value, isCrit, eventCode)
         local shown = (type(value) == "number") and FormatShortNumber(value) or tostring(value)
         text = "|c" .. tostring(sv[spec.color]) .. shown .. mark .. "|r"
     end
-    SetStyledLabelText(label, text, eventCode)
+    SetStyledLabelText(label, text, eventCode, isCrit)
 
     MCT:Animate(label, (isCrit and spec.critAnim) or spec.anim, key)
 end
@@ -1803,7 +1842,7 @@ function MCT:ShowText(value, isCrit, isHeal, special, sID, unitId, isBlocked, ab
     SetStyledLabelText(label,
         "|c" .. tostring(sv[style.color]) .. style.prefix .. FormatShortNumber(value) .. style.postfix .. "|r"
             .. MCT:GetAbilityNameSuffix(abilityId, abilityIds),
-        eventCode)
+        eventCode, isCrit)
     MCT:Animate(label, style.anim, key)
 end
 -------------------------------------------------------
