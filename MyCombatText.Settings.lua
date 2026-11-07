@@ -256,7 +256,7 @@ function MCT:InitSettingsPanel()
         name = "Better Combat Text",
         displayName = "|cff00ccBetter Combat Text|r",
         author = "Vixen Hunny",
-        version = "1.1",
+        version = "1.2",
         slashCommand = "/bctsettings",
         registerForRefresh = true,
         registerForDefaults = true,
