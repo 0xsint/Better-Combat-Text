@@ -445,6 +445,7 @@ function MCT:ApplyPreset(presetName)
     end
     
     MCT.Presets.current = presetName
+    MCT.sv.activePreset = presetName
     d("[MCT] Applied preset: " .. presetName)
     return true
 end

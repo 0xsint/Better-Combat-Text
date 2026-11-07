@@ -91,6 +91,8 @@ Floating labels are not created per-event; `MCT:InitPool()` pre-allocates a fixe
 
 | Command | Description |
 |---|---|
+| `/mct` | Open the settings panel. |
+| `/mct test` | Preview sample labels (damage, crit, heal, damage taken, stun, burst, alert) so you can check styling out of combat. |
 | `/mct preset <name>` | Switch to a preset: `LUI_ENHANCED`, `LUI_CLASSIC`, `MINIMAL`, `DETAILED`. |
 | `/mct presets` | List all available preset names. |
 | `/mct help` | Print command reference to chat. |
@@ -111,17 +113,18 @@ See [FEATURES_GUIDE.md](/c:/Users/Admin/AppData/Local/Elder Scrolls Online/pccer
 
 ## Configuration
 
-All user settings live in `MCT.sv` (backed by `ZO_SavedVars`, saved variable name `MCT_Saved`) and are seeded from `MCT.defaults` in [MyCombatText.lua](/c:/Users/Admin/AppData/Local/Elder Scrolls Online/pccert/CachedData/AddOnsManaged/MyCombatText/MyCombatText.lua). Applying a preset overwrites the relevant keys in `MCT.sv`. Settings are editable in-game via **Settings → Better Combat Text** (requires LibAddonMenu-2.0), covering:
+All user settings live in `MCT.sv` (backed by `ZO_SavedVars`, saved variable name `MCT_Saved`) and are seeded from `MCT.defaults` in [MyCombatText.lua](/c:/Users/Admin/AppData/Local/Elder Scrolls Online/pccert/CachedData/AddOnsManaged/MyCombatText/MyCombatText.lua). Applying a preset overwrites the relevant keys in `MCT.sv`. Settings are editable in-game via **Settings → Add-Ons → Better Combat Text** (or `/mct`), built in `MyCombatText.Settings.lua`. The panel opens with a short quick-setup block (enable, preset, **Preview**, reset) followed by collapsible sections:
 
-- Colors and font sizes per event category
-- Position offsets (X/Y) per event category
-- Per-category show/hide toggles
-- Animation duration/rise/jitter
-- Merge window timing
-- Burst / shield-break / DPS thresholds
-- Marker rules and reticle highlight
-- Low-resource warning thresholds
-- PvP-only and reticle-anchoring behavior toggles
+| Section | Contents |
+|---|---|
+| What to show | Damage, DoTs, damage taken, healing, overhealing, crits-only, ability names/icons, each crowd-control type, mitigated attacks, resources, XP/CP/AP |
+| Alerts & warnings | Block/exploit/interrupt/dodge/cleanse tips, execute alert, low health/magicka/stamina (each with its own threshold), ultimate/potion ready, sound |
+| Look & feel | Text style, hearts, overall scale, font multiplier, gamepad boosts, animation |
+| Font sizes | One slider per label type |
+| Colors | Color pickers for every label type |
+| Positions | Global shift, follow-reticle, per-category X/Y offsets, Preview button |
+| Combat analysis | Burst, shield break, reticle flash, DPS, target markers |
+| Performance | PvP-only, merge window, max labels on screen, heavy-combat mode |
 
 ## Requirements
 

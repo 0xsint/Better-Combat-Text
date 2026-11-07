@@ -608,6 +608,10 @@ function MCT:OnBurst(targetUnitId, burst)
             MCT.reticleFlashTL = rtl
             MCT._reticleFlashHoldMs = holdMs
         end
+        if MCT.HexToRGB then
+            local r, g, b = MCT.HexToRGB(MCT.sv.reticleHighlightColor)
+            MCT.reticleFlash:SetColor(r, g, b, 1)
+        end
         MCT.reticleFlash:SetAlpha(1)
         rtl:PlayFromStart()
     end

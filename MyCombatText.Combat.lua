@@ -59,6 +59,18 @@ local POWER_HEALTH_LEGACY = POWERTYPE_HEALTH
 
 local UNIT_PLAYER = COMBAT_UNIT_TYPE_PLAYER
 
+-- Per-type "show" toggle for crowd-control / dodge labels.
+local CC_TOGGLE = {
+    dodged = "showDodges",
+    stunned = "showStuns",
+    feared = "showFears",
+    charmed = "showCharms",
+    silenced = "showSilences",
+    disoriented = "showDisorients",
+    offbalanced = "showOffbalances",
+    immobilized = "showImmobilizes",
+}
+
 -- Cached colored label text (see MCT:ColorTextCached in Formatting.lua).
 local function Colored(hex, text)
     return MCT:ColorTextCached(hex, text)
@@ -179,7 +191,9 @@ local function HandleCombatEvent(result, powerType, sourceIsPlayer, targetIsPlay
     -- ---- Crowd control / dodge (either direction) ----
     local ccSpecial = GetCCSpecial(result)
     if ccSpecial then
-        MCT:ShowText(nil, false, false, ccSpecial, sourceUnitId, targetUnitId, false, abilityId)
+        if sv[CC_TOGGLE[ccSpecial]] ~= false then
+            MCT:ShowText(nil, false, false, ccSpecial, sourceUnitId, targetUnitId, false, abilityId)
+        end
         return
     end
 
